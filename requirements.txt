@@ -1,0 +1,4 @@
+PySide6
+PyMuPDF
+pandas
+fugashi[unidic-lite]
