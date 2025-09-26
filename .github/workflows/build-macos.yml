@@ -3,15 +3,16 @@ name: build-macos (arm64 & intel)
 on:
   push:
     tags: ['v*', 'release-*']   # タグを切ったらビルド
-  workflow_dispatch:            # 手動実行
+  workflow_dispatch:            # 手動実行もOK
 
+# 任意：同一ブランチの並行起動を抑止したい場合
 concurrency:
   group: macos-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  APP_NAME: HyoukiYureCheck
-  ENTRYPOINT: hyouki_yure_check.py   # ← あなたのエントリーファイル名に合わせて変更
+  APP_NAME: HyoukiYureCheck              # .app / .dmg の表示名
+  ENTRYPOINT: hyouki_yure_check.py       # ← エントリーファイル（例）。サブフォルダなら src/xxx.py など
 
 jobs:
   build:
@@ -34,15 +35,23 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install -U pip
-          # 依存（requirements にあるならこの行は残しつつ、念のため明示インストール）
-          pip install -r requirements.txt || true
+          # requirements.txt があるなら優先して読む（なくても続行する）
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+          # 念のため明示インストール（不足分を補完）
           pip install "fugashi[unidic-lite]" PyMuPDF PySide6 pandas
           pip install pyinstaller
 
-      - name: Sanity check DICDIR (optional)
+      # 参考：unidic_lite の DICDIR が取れているか確認（ログ用）
+      - name: Sanity check DICDIR
+        shell: bash
         run: |
+          set -euo pipefail
           python - <<'PY'
           import unidic_lite
           print("unidic_lite.DICDIR =", getattr(unidic_lite, "DICDIR", None))
@@ -51,25 +60,28 @@ jobs:
       - name: Build (.app) with PyInstaller
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean --windowed \
-            --name "${APP_NAME}" \
-            --hidden-import fitz \
-            --hidden-import unidic_lite \              # ← DICDIR 定義のため必須
-            --collect-data unidic_lite \               # ← 辞書データを同梱
-            --collect-data fugashi \                   # ← 安全側に同梱
-            "${ENTRYPOINT}"
+          set -euo pipefail
+          echo "ENTRYPOINT=$ENTRYPOINT"
+          # エントリーファイルの存在を事前に確認（原因切り分けを明確に）
+          if [ ! -f "$ENTRYPOINT" ]; then
+            echo "::error title=ENTRYPOINT not found::'$ENTRYPOINT' が見つかりません。env.ENTRYPOINT と実ファイル名/パスを確認してください。"
+            echo "リポジトリのルート内容:"; ls -al
+            exit 1
+          fi
 
-      - name: Pack .dmg (compressed)
+          # 行継続を使わず1行で実行（YAML改行事故を防ぐ）
+          pyinstaller --noconfirm --clean --windowed --name "$APP_NAME" --hidden-import fitz --hidden-import unidic_lite --collect-data unidic_lite --collect-data fugashi "$ENTRYPOINT"
+
+      - name: Pack .dmg (compressed) & keep only .dmg
         shell: bash
         run: |
+          set -euo pipefail
           cd dist
           APP="${APP_NAME}.app"
           DMG="${APP_NAME}-${{ matrix.runner }}.dmg"
-          # UDZO で圧縮された DMG を作成
-          hdiutil create -volname "${APP_NAME}" \
-            -srcfolder "${APP}" \
-            -ov -format UDZO "${DMG}"
-          # .dmg だけ残して .app は消して容量節約（アーティファクトも .dmg のみ）
+          # 圧縮DMG（UDZO）を作成
+          hdiutil create -volname "${APP_NAME}" -srcfolder "${APP}" -ov -format UDZO "${DMG}"
+          # 配布は .dmg のみにするため .app は削除してサイズ節約
           rm -rf "${APP}"
 
       - name: Upload artifact (.dmg only)
