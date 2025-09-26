@@ -2156,7 +2156,7 @@ class DropArea(QTextEdit):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("PDF 表記ゆれチェック [ver.1.10]"); self.resize(1180, 860)
+        super().__init__(); self.setWindowTitle("PDF 表記ゆれチェック [ver.1.20]"); self.resize(1180, 860)
         central = QWidget(); self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
@@ -2338,7 +2338,7 @@ class MainWindow(QMainWindow):
         ops = QHBoxLayout()
         self.btn_select_all = QPushButton("すべて選択")
         self.btn_clear_sel = QPushButton("すべて解除")
-        self.btn_export = QPushButton("CSVエクスポート")
+        self.btn_export = QPushButton("Excelエクスポート")
         self.btn_mark = QPushButton("PDFにマーキング")
 
         ops.addWidget(self.btn_select_all)
@@ -2641,19 +2641,229 @@ class MainWindow(QMainWindow):
         menu.exec(self.view_unified.viewport().mapToGlobal(pos))
 
     def on_export(self):
-        df_unified = getattr(self.model_unified, "_df", pd.DataFrame())
-        if df_unified.empty:
-            QMessageBox.information(self, "情報", "エクスポートするデータがありません。"); return
-        out = QFileDialog.getExistingDirectory(self, "出力フォルダを選択")
-        if not out: return
+        """
+        Excel（全件データ＋初期フィルタ見た目）を出力。
+        - データは全件
+        - 開いた直後の見た目はGUIと同じ（オートフィルタ宣言＋非該当行を非表示）
+        - xlsxwriter 優先。無ければ openpyxl でも近い見た目
+        - ※「フィルタ設定」シートは出しません
+        """
+        import pandas as pd
+        import json, math as _math
+
+        # ---------- 0) 全件DFの取得（「選択」列付き） ----------
         try:
-            try:
-                df_unified.to_csv(os.path.join(out, "variants_unified.csv"),
-                                  index=False, encoding="utf-8-sig", line_terminator="\r\n")
-            except TypeError:
-                df_unified.to_csv(os.path.join(out, "variants_unified.csv"),
-                                  index=False, encoding="utf-8-sig", lineterminator="\r\n")
-            QMessageBox.information(self, "完了", "CSVを出力しました。")
+            df_all = self._build_unified_df_with_selection_all()
+        except Exception:
+            src_df = getattr(self.model_unified, "_df", pd.DataFrame()).copy()
+            checks = list(getattr(self.model_unified, "_checks", []))
+            if src_df.empty:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
+                return
+            if len(checks) != len(src_df):
+                checks = [False] * len(src_df)
+            df_all = src_df.reset_index(drop=True)
+            df_all.insert(0, "選択", checks)
+            if "字数" not in df_all.columns and "a" in df_all.columns:
+                df_all["字数"] = df_all["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
+
+        # ---------- 1) Excel安全化（dict/list → JSON、NaN→空） ----------
+        def _sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+            def coerce(v):
+                if v is None: return ""
+                if isinstance(v, float) and _math.isnan(v): return ""
+                if isinstance(v, (dict, list, tuple, set)):
+                    try: return json.dumps(v, ensure_ascii=False)
+                    except Exception: return str(v)
+                return v
+            df = df.copy()
+            for c in df.columns:
+                if df[c].dtype == "object":
+                    df[c] = df[c].map(coerce)
+            return df
+
+        df_all = _sanitize_df_for_excel(df_all)
+
+        # ---------- 2) 保存パス ----------
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        default_name = "variants_unified.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Excelの保存先", default_name, "Excel ファイル (*.xlsx)"
+        )
+        if not path:
+            return
+
+        # ---------- 3) エンジン選択（xlsxwriter 優先） ----------
+        try:
+            import xlsxwriter  # noqa
+            engine = "xlsxwriter"
+        except Exception:
+            engine = "openpyxl"
+
+        # ---------- 4) GUIフィルタ状態 ----------
+        scopes_on  = sorted(list(self._selected_scopes()))  if hasattr(self, "_selected_scopes")  else []
+        reasons_on = sorted(list(self._selected_reasons())) if hasattr(self, "_selected_reasons") else []
+        hide_prefix = bool(getattr(self, "chk_edge_prefix", None) and self.chk_edge_prefix.isChecked())
+        hide_suffix = bool(getattr(self, "chk_edge_suffix", None) and self.chk_edge_suffix.isChecked())
+        short_on    = bool(getattr(self, "chk_shortlen", None) and self.chk_shortlen.isChecked())
+        short_n     = int(self.sb_shortlen.value()) if short_on else None
+        fulltext    = (getattr(self, "ed_filter", None).text() if hasattr(self, "ed_filter") else "") or ""
+        fulltext    = fulltext.strip()
+        need_full   = bool(fulltext)
+
+        # ---------- 5) 許可リスト（Blanks対応）＆ 補助列 ----------
+        BLANK_TOKEN = "Blanks"  # XlsxWriter の特別トークン（"" ではなくこれを使う）
+
+        # 端差
+        edge_allowed_list, edge_allow_blank = None, False
+        if "端差" in df_all.columns:
+            series = df_all["端差"].astype(str)
+            uniq = set(s.strip() for s in series.fillna(""))
+            deny = set()
+            if hide_prefix: deny |= {"前1字有無", "前1字違い"}
+            if hide_suffix: deny |= {"後1字有無", "後1字違い"}
+            edge_allow_blank = ("" in uniq)  # 空セルも見せる（必要に応じて調整）
+            allowed = [v for v in sorted(uniq) if v and v not in deny]
+            if edge_allow_blank:
+                allowed = [BLANK_TOKEN] + allowed
+            edge_allowed_list = allowed
+
+        # 数字以外一致
+        num_allowed_list, num_allow_blank = None, False
+        if "数字以外一致" in df_all.columns and getattr(self, "chk_num_only", None) and self.chk_num_only.isChecked():
+            series = df_all["数字以外一致"].astype(str)
+            uniq = set(s.strip() for s in series.fillna(""))
+            num_allow_blank = ("" in uniq)
+            allowed = [v for v in sorted(uniq) if v and v != "数字以外一致"]
+            if num_allow_blank:
+                allowed = [BLANK_TOKEN] + allowed
+            num_allowed_list = allowed
+
+        # 補助列：全文__concat（contains）
+        if need_full:
+            cols_for_full = [c for c in ["a", "b", "一致要因", "対象"] if c in df_all.columns]
+            df_all["全文__concat"] = (
+                df_all[cols_for_full].astype(str).fillna("").agg(" / ".join, axis=1)
+            ) if cols_for_full else ""
+
+        # ---------- 6) 初期表示マスク（True=表示） ----------
+        mask = pd.Series(True, index=df_all.index)
+        if scopes_on and "対象" in df_all.columns:
+            mask &= df_all["対象"].astype(str).isin(scopes_on)
+        if reasons_on and "一致要因" in df_all.columns:
+            mask &= df_all["一致要因"].astype(str).isin(reasons_on)
+
+        if edge_allowed_list is not None and "端差" in df_all.columns:
+            vals = df_all["端差"].astype(str).fillna("")
+            nonblank_set = set(v for v in edge_allowed_list if v != BLANK_TOKEN)
+            cond_nonblank = vals.str.strip().isin(nonblank_set) if nonblank_set else pd.Series(False, index=vals.index)
+            cond_blank    = vals.str.strip().eq("") if edge_allow_blank else pd.Series(False, index=vals.index)
+            mask &= (cond_nonblank | cond_blank)
+
+        if num_allowed_list is not None and "数字以外一致" in df_all.columns:
+            vals = df_all["数字以外一致"].astype(str).fillna("")
+            nonblank_set = set(v for v in num_allowed_list if v != BLANK_TOKEN)
+            cond_nonblank = vals.str.strip().isin(nonblank_set) if nonblank_set else pd.Series(False, index=vals.index)
+            cond_blank    = vals.str.strip().eq("") if num_allow_blank else pd.Series(False, index=vals.index)
+            mask &= (cond_nonblank | cond_blank)
+
+        if short_on and "字数" in df_all.columns:
+            mask &= pd.to_numeric(df_all["字数"], errors="coerce").fillna(0) > short_n
+        if need_full and "全文__concat" in df_all.columns:
+            mask &= df_all["全文__concat"].astype(str).str.contains(fulltext, case=False, na=False)
+
+        # ---------- 7) 書き出し ----------
+        try:
+            with pd.ExcelWriter(path, engine=engine) as writer:
+                sheet_main = "表記ゆれ候補"
+                df_all.to_excel(writer, index=False, sheet_name=sheet_main)
+
+                nrows, ncols = df_all.shape
+
+                # 列インデックス
+                def col_idx(col_name):
+                    try: return df_all.columns.get_loc(col_name)
+                    except Exception: return None
+                idx_len   = col_idx("字数")
+                idx_reason= col_idx("一致要因")
+                idx_scope = col_idx("対象")
+                idx_edge  = col_idx("端差")
+                idx_num   = col_idx("数字以外一致")
+                idx_full  = col_idx("全文__concat") if need_full else None
+
+                if engine == "xlsxwriter":
+                    wb = writer.book
+                    ws = writer.sheets[sheet_main]
+
+                    # ❶ フリーズ＋オートフィルタ枠（全件）
+                    ws.freeze_panes(1, 1)
+                    ws.autofilter(0, 0, nrows, max(0, ncols - 1))
+
+                    # ❷ フィルタ条件の宣言（Blanksは特別トークン）
+                    if idx_scope is not None and scopes_on:
+                        uniq_scopes = set(str(x) for x in df_all["対象"].dropna().astype(str))
+                        if len(scopes_on) < len(uniq_scopes):
+                            ws.filter_column_list(idx_scope, [str(v) for v in scopes_on])
+
+                    if idx_reason is not None and reasons_on:
+                        uniq_reasons = set(str(x) for x in df_all["一致要因"].dropna().astype(str))
+                        if len(reasons_on) < len(uniq_reasons):
+                            ws.filter_column_list(idx_reason, [str(v) for v in reasons_on])
+
+                    if idx_edge is not None and edge_allowed_list is not None:
+                        uniq_edge = set(str(x).strip() for x in df_all["端差"].fillna(""))
+                        if 0 < len(edge_allowed_list) < len(uniq_edge) + (1 if edge_allow_blank else 0):
+                            ws.filter_column_list(idx_edge, edge_allowed_list)
+
+                    if idx_num is not None and num_allowed_list is not None:
+                        uniq_num = set(str(x).strip() for x in df_all["数字以外一致"].fillna(""))
+                        if 0 < len(num_allowed_list) < len(uniq_num) + (1 if num_allow_blank else 0):
+                            ws.filter_column_list(idx_num, num_allowed_list)
+
+                    if idx_len is not None and short_on:
+                        ws.filter_column(idx_len, f'x > {short_n}')
+
+                    if idx_full is not None and fulltext:
+                        def _xf_escape(s: str) -> str:
+                            return s.replace('~', '~~').replace('*', '~*').replace('?', '~?')
+                        ws.filter_column(idx_full, f'x == *{_xf_escape(fulltext)}*')
+                        ws.set_column(idx_full, idx_full, None, None, {"hidden": True})
+
+                    # ❸ 初期表示で非該当行を非表示（ヘッダ0を除外）
+                    for i, ok in enumerate(mask.tolist()):
+                        if not ok:
+                            ws.set_row(i + 1, None, None, {'hidden': True})
+
+                    # ❹ 列幅
+                    num_fmt = wb.add_format({"align": "right"})
+                    def set_w(name, width, fmt=None):
+                        ci = col_idx(name)
+                        if ci is not None:
+                            ws.set_column(ci, ci, width, fmt)
+                    set_w("選択", 7)
+                    set_w("gid", 7, num_fmt)
+                    set_w("字数", 6, num_fmt)
+                    set_w("a", 32); set_w("b", 32)
+                    set_w("一致要因", 12); set_w("対象", 10)
+                    set_w("端差", 10); set_w("数字以外一致", 12)
+
+                else:
+                    # openpyxl：枠＋B2固定＋非該当行の非表示
+                    ws = writer.sheets[sheet_main]
+                    try:
+                        from openpyxl.utils import get_column_letter
+                        last_row = max(1, nrows + 1)      # ヘッダ込み
+                        last_col = max(1, ncols)
+                        ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}{last_row}"
+                        ws.freeze_panes = "B2"
+                        for i, ok in enumerate(mask.tolist(), start=2):
+                            if not ok:
+                                ws.row_dimensions[i].hidden = True
+                    except Exception:
+                        pass
+
+            QMessageBox.information(self, "完了", "Excel（全件＋初期フィルタ）を出力しました。")
         except Exception as e:
             QMessageBox.critical(self, "エラー", str(e))
 
@@ -2975,6 +3185,106 @@ class MainWindow(QMainWindow):
                 view.setColumnWidth(idx, w)
                 # 以後は自動リサイズではなく“手動ベース”にしておく
                 hdr.setSectionResizeMode(idx, QHeaderView.Interactive)
+
+    def _build_filtered_unified_df(self) -> pd.DataFrame:
+        """現在のフィルタ結果（表示中の行のみ）をDataFrameとして返す。先頭に「選択」列を付与。"""
+        src_df = getattr(self.model_unified, "_df", pd.DataFrame())
+        if src_df.empty:
+            # 「選択」列だけを持つ空表（ヘッダ付きでExcelに出せる）
+            return pd.DataFrame(columns=["選択"] + list(src_df.columns))
+
+        rows_src = []
+        sel_flags = []
+        for r_proxy in range(self.proxy_unified.rowCount()):
+            sidx = self.proxy_unified.mapToSource(self.proxy_unified.index(r_proxy, 0))
+            i = sidx.row()
+            if i < 0 or i >= len(self.model_unified._checks):
+                continue
+            rows_src.append(i)
+            sel_flags.append(bool(self.model_unified._checks[i]))
+
+        if not rows_src:
+            return pd.DataFrame(columns=["選択"] + list(src_df.columns))
+
+        out = src_df.iloc[rows_src].copy().reset_index(drop=True)
+        out.insert(0, "選択", sel_flags)
+
+        # 列の並びを軽く整える（見やすさ重視）
+        cols = list(out.columns)
+        prefer = [c for c in ["選択", "gid", "字数", "a", "b", "一致要因", "対象", "端差", "数字以外一致"] if c in cols]
+        rest = [c for c in cols if c not in prefer]
+        out = out[prefer + rest]
+        return out
+
+    def _current_filter_state(self) -> dict:
+        """GUIのフィルタ状態を辞書で返す（Excelの「フィルタ設定」シート用）。"""
+        return {
+            "全文": self.ed_filter.text() or "",
+            "対象（表示）": "、".join(sorted(self._selected_scopes())),
+            "一致要因（表示）": "、".join(sorted(self._selected_reasons())),
+            "前1文字差を非表示": "ON" if self.chk_edge_prefix.isChecked() else "OFF",
+            "後1文字差を非表示": "ON" if self.chk_edge_suffix.isChecked() else "OFF",
+            "数字以外一致を非表示": "ON" if self.chk_num_only.isChecked() else "OFF",
+            "字数フィルタ 有効": "ON" if self.chk_shortlen.isChecked() else "OFF",
+            "字数フィルタ（n以下を隠す）": self.sb_shortlen.value() if self.chk_shortlen.isChecked() else "",
+            "読み 類似しきい値": self.dsb_read.value(),
+            "文字 類似しきい値": self.dsb_char.value(),
+            "解析ファイル数": len(self.files),
+            "解析ファイル一覧": "\n".join(self.files),
+            "エクスポート日時": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _build_unified_df_with_selection_all(self) -> pd.DataFrame:
+        """
+        フィルタ前の全件（model_unified._df 全行）に「選択」列を付けて返す。
+        Excel出力で“データは全件、見た目はフィルタ適用”を実現するための基礎DF。
+        """
+        src_df = getattr(self.model_unified, "_df", pd.DataFrame())
+        if src_df.empty:
+            return pd.DataFrame(columns=["選択"] + list(src_df.columns))
+
+        # 現在のチェック状態を先頭列に
+        checks = list(getattr(self.model_unified, "_checks", []))
+        if len(checks) != len(src_df):
+            # サイズが違う（何かの操作直後等）は全Falseで揃える
+            checks = [False] * len(src_df)
+
+        out = src_df.copy().reset_index(drop=True)
+        out.insert(0, "選択", checks)
+
+        # 補助：'字数' 列が無ければ a の長さから作る（Excelの数値フィルタ用）
+        if "字数" not in out.columns and "a" in out.columns:
+            out["字数"] = out["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
+
+        return out
+
+    def _sanitize_df_for_excel(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Excel出力前の安全化:
+        - dict / list / tuple / set は JSON 文字列化
+        - None/NaN は空文字
+        - それ以外はそのまま（数値は数値のまま）
+        """
+        import json
+        import math
+        def coerce(v):
+            # NaN も空へ
+            if v is None:
+                return ""
+            if isinstance(v, float) and math.isnan(v):
+                return ""
+            # コンテナ系はJSON化（ensure_ascii=Falseで日本語もOK）
+            if isinstance(v, (dict, list, tuple, set)):
+                try:
+                    return json.dumps(v, ensure_ascii=False)
+                except Exception:
+                    return str(v)
+            return v
+
+        for col in df.columns:
+            # object列のみmap（数値列は触らない）
+            if df[col].dtype == "object":
+                df[col] = df[col].map(coerce)
+        return df
 
 def main():
     app = QApplication(sys.argv)
