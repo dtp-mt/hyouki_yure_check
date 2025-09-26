@@ -2,8 +2,17 @@ name: build-macos (arm64 & intel)
 
 on:
   push:
-    tags: ['v*', 'release-*']   # タグを切ったときにビルド
-  workflow_dispatch:            # 手動実行も可
+    tags: ['v*', 'release-*']   # タグを切ったらビルド
+  workflow_dispatch:            # 手動実行
+
+# 任意：同時起動の衝突を避ける場合
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: HyoukiYureCheck
+  ENTRYPOINT: hyouki_yure_check.py   # ← エントリーのファイル名に合わせて変更してね
 
 jobs:
   build:
@@ -12,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Apple Silicon (arm64) と Intel (x86_64) を並列でビルド
+        # Apple Silicon (arm64) と Intel (x86_64) を並列ビルド
         runner: [macos-14, macos-15-intel]
 
     steps:
@@ -23,35 +32,50 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install -U pip
-          pip install -r requirements.txt
+          # 依存パッケージ（例）：fugashi と unidic-lite を確実に入れる
+          pip install -r requirements.txt || true
+          pip install "fugashi[unidic-lite]" PyMuPDF PySide6 pandas
           pip install pyinstaller
 
-      - name: Build (PyInstaller)
+      # 参考: ここで DICDIR が取得できるか軽くチェック（ログ確認用）
+      - name: Sanity check DICDIR
         run: |
-          # ▼ GUI アプリとして .app を生成
+          python - <<'PY'
+          import unidic_lite
+          print("unidic_lite.DICDIR =", getattr(unidic_lite, "DICDIR", None))
+          PY
+
+      - name: Build (.app) with PyInstaller
+        shell: bash
+        run: |
           pyinstaller --noconfirm --clean --windowed \
-            --name "HyoukiYureCheck" \
+            --name "${APP_NAME}" \
             --hidden-import fitz \
-            --collect-data unidic_lite \
-            hyouki_yure_check.py
+            --hidden-import unidic_lite \              # ← これが肝（DICDIR 定義のため）
+            --collect-data unidic_lite \               # ← 辞書データを同梱
+            --collect-data fugashi \                   # ← 安全側（メタデータ等の取りこぼし防止）
+            "${ENTRYPOINT}"
 
       - name: Pack .dmg
+        shell: bash
         run: |
-          APP="HyoukiYureCheck.app"
-          DMG="HyoukiYureCheck-${{ matrix.runner }}.dmg"
-          # 簡易 DMG 作成
-          hdiutil create -volname "HyoukiYureCheck" \
-            -srcfolder "dist/${APP}" \
-            -ov -format UDZO "dist/${DMG}"
+          cd dist
+          APP="${APP_NAME}.app"
+          DMG="${APP_NAME}-${{ matrix.runner }}.dmg"
+          # 簡易 DMG 作成（hdiutil は macOS ランナーに標準搭載）
+          hdiutil create -volname "${APP_NAME}" \
+            -srcfolder "${APP}" \
+            -ov -format UDZO "${DMG}"
 
-      - name: Upload artifact
+      - name: Upload artifact (.app & .dmg)
         uses: actions/upload-artifact@v4
         with:
-          name: hyoukiyurecheck-${{ matrix.runner }}
+          name: ${ { matrix.runner } }-macos-${{ env.APP_NAME }}
           path: |
-            dist/HyoukiYureCheck.app
-            dist/HyoukiYureCheck-${{ matrix.runner }}.dmg
+            dist/${{ env.APP_NAME }}.app
+            dist/${{ env.APP_NAME }}-${{ matrix.runner }}.dmg
