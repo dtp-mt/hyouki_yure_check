@@ -5,14 +5,13 @@ on:
     tags: ['v*', 'release-*']   # タグを切ったらビルド
   workflow_dispatch:            # 手動実行
 
-# 任意：同時起動の衝突を避ける場合
 concurrency:
   group: macos-${{ github.ref }}
   cancel-in-progress: false
 
 env:
   APP_NAME: HyoukiYureCheck
-  ENTRYPOINT: hyouki_yure_check.py   # ← エントリーのファイル名に合わせて変更してね
+  ENTRYPOINT: hyouki_yure_check.py   # ← あなたのエントリーファイル名に合わせて変更
 
 jobs:
   build:
@@ -37,13 +36,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install -U pip
-          # 依存パッケージ（例）：fugashi と unidic-lite を確実に入れる
+          # 依存（requirements にあるならこの行は残しつつ、念のため明示インストール）
           pip install -r requirements.txt || true
           pip install "fugashi[unidic-lite]" PyMuPDF PySide6 pandas
           pip install pyinstaller
 
-      # 参考: ここで DICDIR が取得できるか軽くチェック（ログ確認用）
-      - name: Sanity check DICDIR
+      - name: Sanity check DICDIR (optional)
         run: |
           python - <<'PY'
           import unidic_lite
@@ -56,26 +54,26 @@ jobs:
           pyinstaller --noconfirm --clean --windowed \
             --name "${APP_NAME}" \
             --hidden-import fitz \
-            --hidden-import unidic_lite \              # ← これが肝（DICDIR 定義のため）
+            --hidden-import unidic_lite \              # ← DICDIR 定義のため必須
             --collect-data unidic_lite \               # ← 辞書データを同梱
-            --collect-data fugashi \                   # ← 安全側（メタデータ等の取りこぼし防止）
+            --collect-data fugashi \                   # ← 安全側に同梱
             "${ENTRYPOINT}"
 
-      - name: Pack .dmg
+      - name: Pack .dmg (compressed)
         shell: bash
         run: |
           cd dist
           APP="${APP_NAME}.app"
           DMG="${APP_NAME}-${{ matrix.runner }}.dmg"
-          # 簡易 DMG 作成（hdiutil は macOS ランナーに標準搭載）
+          # UDZO で圧縮された DMG を作成
           hdiutil create -volname "${APP_NAME}" \
             -srcfolder "${APP}" \
             -ov -format UDZO "${DMG}"
+          # .dmg だけ残して .app は消して容量節約（アーティファクトも .dmg のみ）
+          rm -rf "${APP}"
 
-      - name: Upload artifact (.app & .dmg)
+      - name: Upload artifact (.dmg only)
         uses: actions/upload-artifact@v4
         with:
-          name: ${ { matrix.runner } }-macos-${{ env.APP_NAME }}
-          path: |
-            dist/${{ env.APP_NAME }}.app
-            dist/${{ env.APP_NAME }}-${{ matrix.runner }}.dmg
+          name: ${{ matrix.runner }}-macos-${{ env.APP_NAME }}
+          path: dist/${{ env.APP_NAME }}-${{ matrix.runner }}.dmg
