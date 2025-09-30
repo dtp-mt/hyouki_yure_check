@@ -66,13 +66,9 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          try:
-              import unidic_lite
-              print("unidic_lite.DICDIR =", getattr(unidic_lite, "DICDIR", None))
-              print("unidic_lite sanity: OK")
-          except Exception as e:
-              print("unidic_lite sanity: NG ->", e)
-              raise
+          import unidic_lite
+          print("unidic_lite.DICDIR =", getattr(unidic_lite, "DICDIR", None))
+          print("unidic_lite sanity: OK")
           PY
 
       - name: Sanity check GiNZA
@@ -81,7 +77,7 @@ jobs:
           set -euo pipefail
           python - <<'PY'
           import spacy, ginza  # noqa
-          nlp = spacy.load("ja_ginza")        # モデル同梱確認
+          nlp = spacy.load("ja_ginza")
           doc = nlp("これはテストです。")
           print("GiNZA OK. sentences:", len(list(doc.sents)))
           PY
@@ -107,37 +103,45 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f "$ENTRYPOINT" ]; then
+
+          if [[ ! -f "$ENTRYPOINT" ]]; then
             echo "::error title=ENTRYPOINT not found::'$ENTRYPOINT' が見つかりません。env.ENTRYPOINT と実ファイル名/パスを確認してください。"
             echo "リポジトリのルート内容:"; ls -al
             exit 1
           fi
 
-          pyinstaller --noconfirm --clean --windowed \
-            --name "$APP_NAME" \
-            --hidden-import fitz \
-            --hidden-import unidic_lite \
-            --hidden-import xlsxwriter \
-            --hidden-import openpyxl \
-            --hidden-import et_xmlfile \
-            \
-            # ===== GiNZA / spaCy / Sudachi 同梱 =====
-            --hidden-import ginza \
-            --hidden-import ja_ginza \
-            --hidden-import sudachipy \
-            --hidden-import spacy.lang.ja \
-            --collect-data spacy \
-            --collect-data ginza \
-            --collect-data ja_ginza \
-            --collect-data sudachidict_core \
-            --collect-data sudachipy \
-            --collect-submodules ginza \
-            --additional-hooks-dir hooks \
-            \
-            # ===== 従来どおり（MeCab フォールバック他） =====
-            --collect-data unidic_lite \
-            --collect-data fugashi \
-            "$ENTRYPOINT"
+          # PyInstaller のオプションを配列に（コメント混在でも安全）
+          OPTS=(
+            --noconfirm
+            --clean
+            --windowed
+            --name "$APP_NAME"
+
+            # Excel / MeCab / 基本依存
+            --hidden-import fitz
+            --hidden-import unidic_lite
+            --hidden-import xlsxwriter
+            --hidden-import openpyxl
+            --hidden-import et_xmlfile
+            --collect-data unidic_lite
+            --collect-data fugashi
+
+            # GiNZA / spaCy / Sudachi の同梱
+            --hidden-import ginza
+            --hidden-import ja_ginza
+            --hidden-import sudachipy
+            --hidden-import spacy.lang.ja
+            --collect-data spacy
+            --collect-data ginza
+            --collect-data ja_ginza
+            --collect-data sudachidict_core
+            --collect-data sudachipy
+            --collect-submodules ginza
+            --additional-hooks-dir hooks
+          )
+
+          echo ">>> Running: pyinstaller ${OPTS[*]} \"$ENTRYPOINT\""
+          pyinstaller "${OPTS[@]}" "$ENTRYPOINT"
 
       - name: Pack .dmg (compressed) & keep only .dmg
         shell: bash
@@ -154,3 +158,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.runner }}-macos-${{ env.APP_NAME }}
+          path: dist/${{ env.APP_NAME }}-${{ matrix.runner }}.dmg
