@@ -2,6 +2,18 @@ PySide6
 PyMuPDF
 pandas
 fugashi[unidic-lite]
-# ここからExcel系
+
+# Excel系
 xlsxwriter
 openpyxl
+
+# --- ここから GiNZA スタック（追加）---
+# spaCy 本体（3.7系目安）
+spacy>=3.7,<3.8
+# GiNZA ランタイム
+ginza>=5,<6
+# 日本語パイプライン（軽量版。重いElectraは非推奨：サイズ爆増）
+ja_ginza>=5,<6
+# Sudachi 形態素解析器 + 辞書（GiNZA内部で使用）
+SudachiPy>=0.6
+sudachidict_core>=2023.1
