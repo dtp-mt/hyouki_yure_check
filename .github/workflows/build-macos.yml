@@ -1,4 +1,4 @@
-name: build-macos (arm64 & intel)
+name: build-macos (arm64 & intel, ginza)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: macos-${{ github.ref }}
+  group: macos-${{ github.ref }}-ginza
   cancel-in-progress: false
 
 env:
@@ -15,7 +15,7 @@ env:
 
 jobs:
   build:
-    name: macOS ${{ matrix.runner }} • PyInstaller
+    name: macOS ${{ matrix.runner }} • PyInstaller • ginza
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -32,43 +32,81 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Show environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          python -V
+          echo "Runner: ${{ matrix.runner }}"
+          echo "ENTRYPOINT=${ENTRYPOINT}"
+
+      - name: Install dependencies (base + GiNZA)
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install -U pip wheel
-          if [ -f requirements.txt ]; then
+
+          if [[ -f requirements.txt ]]; then
             pip install -r requirements.txt
           else
+            # ベース依存（requirements.txt が無い場合の保険）
             pip install "fugashi[unidic-lite]" PyMuPDF PySide6 pandas
             pip install xlsxwriter openpyxl
           fi
+
+          # --- GiNZA スタック（軽量モデル） ---
+          pip install "spacy>=3.7,<3.8" "ginza>=5,<6" "ja_ginza>=5,<6" "SudachiPy>=0.6" "sudachidict_core>=2023.1"
+
+          # PyInstaller
           pip install pyinstaller
 
-      - name: Sanity check DICDIR
+      - name: Sanity check DICDIR (MeCab / unidic_lite)
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import unidic_lite
-          print("unidic_lite.DICDIR =", getattr(unidic_lite, "DICDIR", None))
+          try:
+              import unidic_lite
+              print("unidic_lite.DICDIR =", getattr(unidic_lite, "DICDIR", None))
+              print("unidic_lite sanity: OK")
+          except Exception as e:
+              print("unidic_lite sanity: NG ->", e)
+              raise
           PY
 
-      - name: Sanity check imports
+      - name: Sanity check GiNZA
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import xlsxwriter, openpyxl
-          print("xlsxwriter:", xlsxwriter.__version__)
-          print("openpyxl  :", openpyxl.__version__)
+          import spacy, ginza  # noqa
+          nlp = spacy.load("ja_ginza")        # モデル同梱確認
+          doc = nlp("これはテストです。")
+          print("GiNZA OK. sentences:", len(list(doc.sents)))
           PY
+
+      # （保険）PyInstaller 用フックを用意：モデル/辞書の取りこぼし防止
+      - name: Create PyInstaller hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p hooks
+          cat > hooks/hook-ja_ginza.py <<'PY'
+          from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+          datas = collect_data_files("ja_ginza", include_py_files=True)
+          hiddenimports = collect_submodules("ja_ginza")
+          PY
+          cat > hooks/hook-sudachidict_core.py <<'PY'
+          from PyInstaller.utils.hooks import collect_data_files
+          datas = collect_data_files("sudachidict_core", include_py_files=False)
+          PY
+          ls -al hooks
 
       - name: Build (.app) with PyInstaller
         shell: bash
         run: |
           set -euo pipefail
-          echo "ENTRYPOINT=$ENTRYPOINT"
           if [ ! -f "$ENTRYPOINT" ]; then
             echo "::error title=ENTRYPOINT not found::'$ENTRYPOINT' が見つかりません。env.ENTRYPOINT と実ファイル名/パスを確認してください。"
             echo "リポジトリのルート内容:"; ls -al
@@ -82,6 +120,21 @@ jobs:
             --hidden-import xlsxwriter \
             --hidden-import openpyxl \
             --hidden-import et_xmlfile \
+            \
+            # ===== GiNZA / spaCy / Sudachi 同梱 =====
+            --hidden-import ginza \
+            --hidden-import ja_ginza \
+            --hidden-import sudachipy \
+            --hidden-import spacy.lang.ja \
+            --collect-data spacy \
+            --collect-data ginza \
+            --collect-data ja_ginza \
+            --collect-data sudachidict_core \
+            --collect-data sudachipy \
+            --collect-submodules ginza \
+            --additional-hooks-dir hooks \
+            \
+            # ===== 従来どおり（MeCab フォールバック他） =====
             --collect-data unidic_lite \
             --collect-data fugashi \
             "$ENTRYPOINT"
@@ -95,9 +148,9 @@ jobs:
           DMG="${APP_NAME}-${{ matrix.runner }}.dmg"
           hdiutil create -volname "${APP_NAME}" -srcfolder "${APP}" -ov -format UDZO "${DMG}"
           rm -rf "${APP}"
+          ls -al
 
       - name: Upload artifact (.dmg only)
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.runner }}-macos-${{ env.APP_NAME }}
-          path: dist/${{ env.APP_NAME }}-${{ matrix.runner }}.dmg
