@@ -164,43 +164,6 @@ def reading_eq_score(a: str, b: str) -> float:
     return round(float(score), 3)
 # ===== [Patch end] ============================================================
 
-def _surface_core_for_reading(s: str) -> str:
-    """
-    読み対象の“和字コア”を抽出:
-      - NFKC 正規化後、
-      - ひらがな/カタカナ/漢字 だけ残す（他は読み対象外として捨てる）
-      - 空白・数字(Nd)・記号(P/S)・ラテン文字・半記号 等は除去
-    例:
-      "000円"  -> "円"
-      "250円"  -> "円"
-      "Ver1.0円" -> "円"
-      "電気"   -> "電気"（両方とも漢字なので残る）
-    """
-    if s is None:
-        s = ""
-    nf = nfkc(str(s))
-    out = []
-    for ch in nf:
-        code = ord(ch)
-        if (0x3040 <= code <= 0x309F) or (0x30A0 <= code <= 0x30FF) or \
-           (0x3400 <= code <= 0x4DBF) or (0x4E00 <= code <= 0x9FFF) or \
-           (0xF900 <= code <= 0xFAFF):
-            out.append(ch)
-        # それ以外（数字・記号・空白・ラテン等）は読み対象外として捨てる
-    return "".join(out)
-
-# ===== [Patch] ℃専用の「読み一致（満点）」ショートカット =========================
-# 目的：
-#   和字コア（かな/カナ/漢字）が両方空（= 読みが取れない記号・英数・単位のみ）で、
-#   「数字を除いた残り」から 温度記号 '°' と 'C/c' を抽出した結果が双方とも「°C」
-#   になる場合に限り、reading_eq（= 満点 1.0）扱いにする。
-#   ※ 単位一般は扱わず、「℃」ケースに限定。
-#
-# 使いどころ：
-#   build_synonym_pairs_general() / _pairs_chunk_worker() の
-#   「読み一致（英数記号除く）」分岐でこの関数が使われるため、ここを差し替えるだけで
-#   「30℃」↔「630W［30℃」や「20℃」↔「30℃」が 1.0 で reading_eq に入ります。
-
 def _temp_marker_core_after_number_strip(s: str) -> str:
     """
     NFKC → 数字まとまり除去（既存の _strip_numbers_like）後、
@@ -352,6 +315,70 @@ def _surface_core_for_reading(s: str) -> str:
             out.append(ch)
     return "".join(out)
 
+# ===== 追加: 囲み数字などの「リストマーカー」を判定 =====
+def _is_enclosed_list_marker(ch: str) -> bool:
+    """
+    '①' '②' ... '㉑' や '❶' '❷' ... などの囲み数字系は
+    「リストマーカー」とみなし、ノイズ扱いしないための判定。
+    """
+    if not ch:
+        return False
+    o = ord(ch)
+    # Enclosed Alphanumerics (一部): ⓪(0x24EA), ①..⑳(0x2460..0x2473), ⑴..⒇ 等
+    if 0x2460 <= o <= 0x24FF or o == 0x24EA:
+        return True
+    # Dingbats (Negative circled digits 等): ❶..➓(0x2776..0x2793)
+    if 0x2776 <= o <= 0x2793:
+        return True
+    # Enclosed Alphanumeric Supplement (拡張の囲み文字): U+1F100..U+1F1FF
+    if 0x1F100 <= o <= 0x1F1FF:
+        return True
+
+# ===== 置換: 非日本語(英字・数字・記号)ノイズの有無を判定 =====
+def _has_non_japanese_noise(s: str) -> bool:
+    """
+    '英数字や記号によるノイズ' が含まれるか。
+    - 日本語スクリプト(漢字/ひら/カタカナ)と空白は無視
+    - 囲み数字などの「リストマーカー」(①, ❶ など)はノイズに数えない
+    - それ以外の ASCII/全角英字・数字・各種記号はノイズとみなす
+    """
+    if s is None:
+        return False
+    # 原字のまま評価（NFKCにすると ①→"1" に潰れてしまうため）
+    for ch in str(s):
+        if not ch or ch.isspace():
+            continue
+        o = ord(ch)
+        # 日本語の主要スクリプト → ノイズではない
+        if (
+            0x3040 <= o <= 0x309F   # ひらがな
+            or 0x30A0 <= o <= 0x30FF  # カタカナ
+            or 0x3400 <= o <= 0x4DBF  # CJK統合漢字拡張A
+            or 0x4E00 <= o <= 0x9FFF  # CJK統合漢字
+            or 0xF900 <= o <= 0xFAFF  # 互換漢字
+        ):
+            continue
+        # 囲み数字などの「リストマーカー」 → ノイズに数えない
+        if _is_enclosed_list_marker(ch):
+            continue
+        # ここからはノイズ候補
+        # ・英数字（ASCII/全角問わず）
+        # ・各種記号（Unicode Category 'S*'）や句読点等（'P*'）
+        cat = unicodedata.category(ch)  # 'Nd' 数字, 'Ll' 小文字, 'Lu' 大文字, 'S*' 記号, 'P*' 句読点など
+        if ch.isdigit() or ('A' <= ch <= 'Z') or ('a' <= ch <= 'z'):
+            return True
+        if cat.startswith('S') or cat.startswith('P'):
+            return True
+        # 全角英字（NFKCせずともカテゴリで拾えない場合があるため補助）
+        ch_nfkc = nfkc(ch)
+        if ch_nfkc != ch:
+            if ch_nfkc.isdigit() or ('A' <= ch_nfkc <= 'Z') or ('a' <= ch_nfkc <= 'z'):
+                return True
+            cat2 = unicodedata.category(ch_nfkc)
+            if cat2.startswith('S') or cat2.startswith('P'):
+                return True
+
+
 def _script_pattern(s: str) -> str:
     """
     文字ごとのスクリプト種別列（K:漢字/H:ひら/C:カナ/O:その他）を返す。
@@ -369,26 +396,16 @@ def _script_pattern(s: str) -> str:
     nf = nfkc(str(s or ""))
     return "".join(tag(ch) for ch in nf if not ch.isspace())
 
+# --- REPLACE: recalibrate_reading_like_scores (重複ヘルパ排除) ---
 def recalibrate_reading_like_scores(df: pd.DataFrame, read_th: float) -> pd.DataFrame:
     """
-    df（columns: a,b,reason,score, ...）のうち、reason が
-    {lemma, lemma_read, inflect, reading} の行を “読み”の規則で **再採点** して
-    reason を 'reading' に揃える。
-
-    減点規則:
-      P0: 表層差（a!=b）                       → -0.01
-      P1: 片側のみ漢字                          → -0.01
-      P2: 表層長差（NFKC/空白除去）             → -0.05
-      P3: lemma 一致 & 表層差                   → -0.02
-      P4: スクリプト構成が同一かつ 読みが異なる → -0.03  ★今回追加
-
-    ただし、和字コア（漢字/かなのみ）が完全一致するケース（= 数字・記号だけの差）は
-    読み 1.0 を **強制維持**（例: 「000円」↔「250円」→「円」一致）。
+    {lemma, lemma_read, inflect, reading} を読みルールで再採点し reason='reading' に揃える。
+    和字コア一致は強制1.0維持。満点時の抑制・P3/P4は現状ロジックを踏襲。
     """
     if df is None or df.empty:
         return df
     need_cols = {"a", "b", "reason", "score"}
-    if not need_cols.issubset(set(df.columns)):
+    if not need_cols.issubset(df.columns):
         return df
 
     mask = df["reason"].isin(READING_LIKE_REASONS)
@@ -397,57 +414,50 @@ def recalibrate_reading_like_scores(df: pd.DataFrame, read_th: float) -> pd.Data
 
     df = df.copy()
 
-    # スキャン対象の表層を一括で前計算（キャッシュ）
+    # ---- 前計算（surface単位）
     surfaces = set(df.loc[mask, "a"].astype(str)) | set(df.loc[mask, "b"].astype(str))
-    surf2read   = {s: _reading_for_surface_cached(s) for s in surfaces}
-    surf2lemma  = {s: _lemma_joined_for_surface(s)   for s in surfaces}
-    surf2core   = {s: _surface_core_for_reading(s)   for s in surfaces}
-    surf2script = {s: _script_pattern(s)             for s in surfaces}
-
-    def _has_kanji(s: str) -> bool:
-        return bool(re.search(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]", nfkc(s or "")))
-
-    def _len_norm(s: str) -> int:
-        return len(re.sub(r"\s+", "", nfkc(s or "")))
+    surf2read = {s: _reading_for_surface_cached(s) for s in surfaces}
+    surf2lemma = {s: _lemma_joined_for_surface(s) for s in surfaces}
+    surf2core  = {s: _surface_core_for_reading(s) for s in surfaces}
+    surf2script = {s: _script_pattern(s) for s in surfaces}
 
     def _calc(row):
         a = str(row["a"]); b = str(row["b"])
 
-        # 1) “和字コア”一致（数字・記号差のみ）→ 読み 1.0 維持
-        if surf2core.get(a, "") and surf2core.get(b, "") and (surf2core[a] == surf2core[b]):
+        # 1) 和字コア一致 → 読み 1.0 維持
+        ca, cb = surf2core.get(a, ""), surf2core.get(b, "")
+        if ca and cb and ca == cb:
             return 1.0
 
-        ra = surf2read.get(a, ""); rb = surf2read.get(b, "")
+        ra, rb = surf2read.get(a, ""), surf2read.get(b, "")
         pattern_equal = (surf2script.get(a, "") == surf2script.get(b, ""))
         read_mismatch = (bool(ra) and bool(rb) and ra != rb)
 
-        # 2) 読みが閾値以上で算出できた場合（内側で満点抑制済み）
+        # 2) 読み類似（満点抑制は reading_sim_with_penalty 内で処理）
         sim = reading_sim_with_penalty(a, b, ra, rb, read_th)
         if sim is not None:
             val = float(sim)
-            # lemma一致 & 表層差 → P3
+            # P3: lemma一致 & 表層差
             if val >= 0.9999 and a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")):
                 val -= 0.02
-            # スクリプト構成が同じ かつ 読みが異なる → P4
+            # P4: 同スクリプト構成 & 読みが異なる
             if pattern_equal and read_mismatch:
                 val -= READ_MISMATCH_PENALTY
             return max(val, 0.0)
 
-        # 3) 読みが取れなかった場合でも、満点のままにしない：ペナルティ合算
+        # 3) 読みが取れなかった場合でも、満点のままにしない（P0/P1/P2/P3/P4 の合算）
         penal = 1.0
-        if a != b: penal -= 0.01                           # P0
-        if _has_kanji(a) != _has_kanji(b): penal -= 0.01   # P1
-        if _len_norm(a) != _len_norm(b): penal -= 0.05     # P2
-        if a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")):
-            penal -= 0.02                                  # P3
-        if pattern_equal and read_mismatch:
-            penal -= READ_MISMATCH_PENALTY                # P4
+        if a != b: penal -= 0.01                                        # P0
+        if _has_kanji(a) != _has_kanji(b): penal -= 0.01                 # P1（グローバルの _has_kanji を利用）
+        if _norm_len_for_surface(a) != _norm_len_for_surface(b): penal -= 0.05  # P2（グローバル利用）
+        if a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")): penal -= 0.02  # P3
+        if pattern_equal and read_mismatch: penal -= READ_MISMATCH_PENALTY      # P4
         return max(penal, 0.0)
 
-    df.loc[mask, "score"]  = df.loc[mask].apply(_calc, axis=1)
+    df.loc[mask, "score"] = df.loc[mask].apply(_calc, axis=1)
     df.loc[mask, "reason"] = "reading"
     return df
-# =============================================================================
+# --- /REPLACE ---
 
 def _ngram_set(s: str, n: int = 2):
     return {s[i:i+n] for i in range(len(s)-n+1)} if len(s) >= n else {s}
@@ -494,7 +504,7 @@ def enforce_combined_similarity_score(
 
     # バックアップ列の扱い
     if drop_existing_backup:
-        df.drop(columns=["sore_reason", "score_reason"], errors="ignore", inplace=True)
+        df.drop(columns=["score_reason"], errors="ignore", inplace=True)
     if keep_backup and "score" in df.columns and "score_reason" not in df.columns:
         df["score_reason"] = pd.to_numeric(df["score"], errors="coerce").round(3)
 
@@ -546,6 +556,197 @@ def reclassify_basic_for_reading_eq(df: pd.DataFrame, eps: float = 0.0005) -> pd
     if m.any():
         df.loc[m, "reason"] = "basic"
         df.loc[m, "score"] = 1.0  # 表示上も 1.0 にそろえる
+    return df
+# =============================================================================
+
+# =============================================================================
+# 読み一致の厳密判定（前置/後置による包含を除外）
+def _readings_equal_strict(a: str, b: str) -> bool:
+    """
+    ① 読み（長音保持）が完全一致（非空）であること
+    ② ただし、和字コア（漢字・ひら・カナのみ）を比較して、
+       一方がもう一方を strict な prefix/suffix として「包含」している場合は除外する
+       （= 前置/後置で語が付加された可能性が高いケースを除く）
+    例：還気温度センサ vs 温度センサ
+        読み: （欠落により）どちらも 'オンドセンサ' になり得るが、
+        和字コアは '還気温度センサ' と '温度センサ' で「後方一致」（suffix包含）→ NG
+    """
+    a_s = "" if a is None else str(a)
+    b_s = "" if b is None else str(b)
+
+    # 読み（長音保持）
+    try:
+        ra = phrase_reading_norm_keepchoon(a_s) or ""
+        rb = phrase_reading_norm_keepchoon(b_s) or ""
+    except Exception:
+        ra, rb = "", ""
+
+    if not (ra and rb):
+        return False
+    if ra != rb:
+        return False
+
+    # 和字コア（漢字・ひら・カナのみ）
+    try:
+        ca = _surface_core_for_reading(a_s) or ""
+        cb = _surface_core_for_reading(b_s) or ""
+    except Exception:
+        ca, cb = "", ""
+
+    if ca and cb and ca != cb:
+        # strict な prefix/suffix 包含か？（完全一致は除外済み）
+        if ca.endswith(cb) or cb.endswith(ca) or ca.startswith(cb) or cb.startswith(ca):
+            # 前置/後置の付加（= 語の増減）とみなし、厳密一致から除外
+            return False
+
+    return True
+# =============================================================================
+
+# =============================================================================
+# === [REPLACE] 読み一致（表記違い）: 厳格読み一致のみ昇格
+#      ※ ただし「英数・記号ノイズ」が片側に含まれる場合は reading_eq を優先
+# =============================================================================
+def reclassify_reading_equal_formdiff(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    'reading' の行から、以下の優先規則で再分類します：
+
+    [優先1] 厳格読み一致(_readings_equal_strict) かつ
+            片側にでも英数・記号ノイズ(_has_non_japanese_noise)が含まれる
+            → reason='reading_eq', score=reading_eq_score(a,b)
+
+    [優先2] それ以外で厳格読み一致(_readings_equal_strict) かつ a!=b
+            → reason='reading_same'（従来昇格）
+
+    [優先3] レマ一致 & 「名詞のみ」&「単一形態素」& 厳格読み一致
+            → reason='reading_same'（従来昇格）
+
+    なお、英数・記号だけの差は 'reading_eq' 領域（is_symbol_only_surface_diff True）
+    とみなし本関数では扱いません（従来どおり）。
+    """
+    if (
+        df is None or df.empty
+        or "reason" not in df.columns
+        or "a" not in df.columns or "b" not in df.columns
+    ):
+        return df
+
+    # まず 'reading' 行のみ対象
+    mask = df["reason"].eq("reading")
+    if not mask.any():
+        return df
+
+    df = df.copy()
+
+    # 表層キャッシュ
+    sub = df.loc[mask, ["a", "b"]].astype("string")
+    surfaces = pd.unique(pd.concat([sub["a"], sub["b"]], ignore_index=True))
+
+    # 読み（長音保持）と レマ のキャッシュ
+    surf2read_keep: Dict[str, str] = {}
+    surf2lemma: Dict[str, str] = {}
+    for s in surfaces:
+        s_str = str(s)
+        try:
+            surf2read_keep[s_str] = phrase_reading_norm_keepchoon(s_str) or ""
+        except Exception:
+            surf2read_keep[s_str] = ""
+        try:
+            surf2lemma[s_str] = _lemma_joined_for_surface(s_str) or ""
+        except Exception:
+            surf2lemma[s_str] = ""
+
+    # MeCab ユーティリティ
+    ok_mecab, _ = ensure_mecab()
+    tagger = MECAB_TAGGER if ok_mecab else None
+
+    def _tokens(s: str):
+        if not tagger:
+            return []
+        try:
+            return tokenize_mecab(s, tagger)
+        except Exception:
+            return []
+
+    def _is_noun_only(s: str) -> bool:
+        toks = _tokens(s)
+        if not toks:
+            return False
+        for _, pos1, *_ in toks:
+            if not (isinstance(pos1, str) and pos1.startswith("名詞")):
+                return False
+        return True
+
+    def _is_single_morpheme(s: str) -> bool:
+        toks = _tokens(s)
+        return len(toks) == 1
+
+    # ここから再分類
+    idx = df.index[mask]
+
+    # 行ごとに適用
+    for i in idx:
+        a = "" if pd.isna(df.at[i, "a"]) else str(df.at[i, "a"])
+        b = "" if pd.isna(df.at[i, "b"]) else str(df.at[i, "b"])
+        if not a or not b or a == b:
+            continue
+
+        # 英数・記号だけの差は 'reading_eq' 領域（ここでは扱わない＝従来）
+        try:
+            if is_symbol_only_surface_diff(a, b):
+                continue
+        except Exception:
+            pass
+
+        # 厳格読み一致？
+        try:
+            eq_strict = _readings_equal_strict(a, b)
+        except Exception:
+            eq_strict = False
+        if not eq_strict:
+            continue
+
+        # --- 優先1：片側にでも英数・記号ノイズが含まれるなら reading_eq 優先 ---
+        try:
+            if _has_non_japanese_noise(a) or _has_non_japanese_noise(b):
+                df.at[i, "reason"] = "reading_eq"
+                df.at[i, "score"] = reading_eq_score(a, b)
+                continue
+        except Exception:
+            # 失敗時は従来どおりの昇格判断へフォールバック
+            pass
+
+        # --- 優先2：厳格読み一致のみでも 'reading_same' へ昇格 ---
+        # （この分岐に来るのは、上のノイズ判定に該当しない純粋な表記差と考える）
+        df.at[i, "reason"] = "reading_same"
+        # score は既存のままでも良いが、読みの厳格一致なので 1.0 にしておく手もある
+        # ただし最終 enforce_combined_similarity_score() が上書きする前提なら不要
+        # df.at[i, "score"] = 1.0
+
+        # --- 優先3：レマ一致 & 名詞のみ & 単一形態素 & 厳格読み一致 も reading_same ---
+        # （上で 'reading_same' 済みなので実質そのまま。明示的に残しておくなら以下）
+        # la, lb = surf2lemma.get(a, ""), surf2lemma.get(b, "")
+        # if la and lb and (la == lb):
+        #     if _is_noun_only(a) and _is_noun_only(b) and _is_single_morpheme(a) and _is_single_morpheme(b):
+        #         df.at[i, "reason"] = "reading_same"
+
+    return df
+
+
+# =============================================================================
+# 'reading_same' の最終サニタイズ（厳格読み一致を満たさなければ 'reading' に戻す）
+def sanitize_reading_same(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "reason" not in df.columns:
+        return df
+    m = df["reason"].eq("reading_same")
+    if not m.any():
+        return df
+    df = df.copy()
+    bad = df.loc[m].apply(
+        lambda r: not _readings_equal_strict(str(r.get("a", "")), str(r.get("b", ""))),
+        axis=1
+    )
+    if bad.any():
+        df.loc[bad[bad].index, "reason"] = "reading"  # 取りやめて 'reading' に戻す
     return df
 # =============================================================================
 
@@ -1216,6 +1417,31 @@ def phrase_reading_norm_cached(s: str) -> str:
     return v
 # ===== 読みキャッシュ ここまで =====
 
+# === [NEW] 長音「ー」を保持する読み（骨格） ================================
+
+def phrase_reading_norm_keepchoon(s: str) -> str:
+    """
+    文字列 s の '読み（骨格）' を生成するが、長音「ー」を保持する版。
+    - ひらがな→カタカナ
+    - カタカナ以外を除去
+    - 長音「ー」は残す（drop_choon=False）
+    MeCab があれば各語の reading を使い、なければ表層の簡易変換でフォールバック。
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+    ok, _ = ensure_mecab()
+    if ok and MECAB_TAGGER is not None:
+        toks = tokenize_mecab(s, MECAB_TAGGER)
+        parts: List[str] = []
+        for surf, pos1, lemma, reading, ct, cf in toks:
+            r = reading or hira_to_kata(nfkc(surf))
+            parts.append(r)
+        joined = "".join(parts)
+        return normalize_kana(joined, drop_choon=False)
+    # fallback: NFKC → カタカナ化 → カタカナ以外除去（長音は残す）
+    return normalize_kana(hira_to_kata(nfkc(s or "")), drop_choon=False)
+
+
 # ------------------------------------------------------------
 # Token抽出（正規表現ベース, MeCabなしフォールバック用）
 # ------------------------------------------------------------
@@ -1570,24 +1796,7 @@ def _edge_labels_vectorized(df: pd.DataFrame) -> pd.Series:
     return res
 
 # ============================================================================
-# 強化版：数字以外一致（数字「まとまり」を無視して比較）
-# 目的:
-#   - 数字そのものだけでなく、数字に付随する桁区切り（, / スペース / NBSP 等）
-#     や小数点（. / 全角．）などを含む “数字のまとまり” を丸ごと無視して比較します。
-#   - 内部判定は NFKC 正規化で行い、全角・半角の違いも吸収します。
-#   - 例: 「1,000」↔「900」「0.1」↔「1」「ver1.2.3」↔「ver2」 などを “数字以外一致” と判定。
-# 備考:
-#   - “数字以外一致” とする条件は従来どおり
-#       ① 元文字列が完全一致ではない
-#       ② 少なくとも片方に数字が含まれる（NFKC基準）
-#       ③ “数字のまとまり” を取り除いた残りが一致
-#     の3点です。
-# ============================================================================
-
-# 数字「まとまり」を検出する正規表現（NFKC 後に適用）
-#  - 先頭に +/- 記号を許容
-#  - 中にカンマ/ドット/空白を挟みつつ最後は数字で終わる連なりを1塊とみなす
-#  - 例: 123 / 1,234 / 1 234 / 1 234 / 0.5 / 1.2.3 / １２，３４５．６（NFKCで吸収）
+# 数字以外一致（数字「まとまり」を無視して比較）
 _NUMERIC_CHUNK_RE = re.compile(r"[+\-]?\d(?:[\d,.\s]*\d)?")
 
 # 空白の正規化（半角スペース/全角スペースを1個の半角スペースに）
@@ -1607,13 +1816,6 @@ def _strip_numbers_like(s: str) -> str:
     return t
 
 def is_numeric_only_diff(a: str, b: str) -> bool:
-    """
-    a, b が“数字だけ異なる”なら True。
-    条件:
-      - a != b（元が同一は False）
-      - 少なくとも片方に数字（NFKC基準）が含まれる
-      - 数字まとまりを除去した残りが一致
-    """
     if a is None and b is None:
         return False
     a_s, b_s = "" if a is None else str(a), "" if b is None else str(b)
@@ -1627,17 +1829,7 @@ def is_numeric_only_diff(a: str, b: str) -> bool:
     # 数字のまとまりを除去して比較
     return _strip_numbers_like(a_s) == _strip_numbers_like(b_s)
 
-def numeric_only_label(a: str, b: str) -> str:
-    """表示用ラベル（該当時のみ '数字以外一致' を返す）"""
-    return "数字以外一致" if is_numeric_only_diff(a, b) else ""
-
 def _numeric_only_label_vectorized(df: pd.DataFrame) -> pd.Series:
-    """
-    DataFrame（a,b列）に対してベクトル風に '数字以外一致' を判定する。
-    - 内部では NFKC + 数字まとまり除去で比較
-    - a,b が同一の行は除外
-    - 少なくとも片方に数字がある行のみ対象
-    """
     a = df["a"].astype("string")
     b = df["b"].astype("string")
 
@@ -2054,78 +2246,59 @@ def build_synonym_pairs_char_only(
 # 統合（★「読み類似」を最優先）
 # ------------------------------------------------------------
 REASON_PRIORITY = {
-    # new: 厳密一致に相当（NFKC同一）を最上位に
-    "basic": 7.2,                 # ★ 追加：基本一致
-    "reading_eq": 6.8,
-    "reading": 6.0,
+    "basic": 7.2,          # 基本一致（NFKC同一）
+    "reading_eq": 6.8,     # 読み一致（英数記号除く）
+    "reading_same": 6.5,   # ★ 追加：読み一致（表記違い）
+    "reading": 6.0,        # 読み類似
     "lemma": 5.0,
     "inflect": 4.5,
     "lemma_read": 4.0,
     "char": 2.0,
 }
 
+# --- REPLACE: unify_pairs (簡素化) ---
 def unify_pairs(*dfs: pd.DataFrame) -> pd.DataFrame:
     frames = []
-    for df in dfs:
-        if df is None or df.empty:
+    for d in dfs:
+        if d is None or d.empty:
             continue
-        tmp = df.copy()
+        t = d.copy()
         for col in PAIR_COLUMNS:
-            if col not in tmp.columns:
-                tmp[col] = pd.NA
-        frames.append(tmp[PAIR_COLUMNS].copy())
-
+            if col not in t.columns:
+                t[col] = pd.NA
+        frames.append(t[PAIR_COLUMNS].copy())
     if not frames:
         return empty_pairs_df()
 
     df = pd.concat(frames, ignore_index=True)
 
-    def norm_row(r):
+    # 正規化キー（a<=b で並べ替えたペア）
+    def _norm_row(r):
         a, b = r["a"], r["b"]
         if pd.isna(a) or pd.isna(b):
             return a, b
         return (a, b) if str(a) <= str(b) else (b, a)
 
-    df[["a_n", "b_n"]] = df.apply(norm_row, axis=1, result_type="expand")
+    df[["a_n", "b_n"]] = df.apply(_norm_row, axis=1, result_type="expand")
 
-    def best_row(g):
-        g = g.copy()
-        g["prio"] = g["reason"].map(REASON_PRIORITY).fillna(1.0)
-        g["sum_count"] = pd.to_numeric(g["a_count"], errors="coerce").fillna(0).astype(int) + \
-                         pd.to_numeric(g["b_count"], errors="coerce").fillna(0).astype(int)
-        g["score"] = pd.to_numeric(g["score"], errors="coerce").fillna(0.0)
-        g = g.sort_values(["prio", "score", "sum_count"], ascending=[False, False, False])
-        top = g.iloc[0].drop(labels=["prio", "sum_count"], errors="ignore")
-        return top
-
-    # --- applyを使わない版（高速＆FutureWarning回避） ---
-    tmp = df.copy()
-
-    # best_row() と同じ並べ替えキーを前計算
-    tmp["prio"] = tmp["reason"].map(REASON_PRIORITY).fillna(1.0)
-    tmp["sum_count"] = (
-        pd.to_numeric(tmp["a_count"], errors="coerce").fillna(0).astype(int) +
-        pd.to_numeric(tmp["b_count"], errors="coerce").fillna(0).astype(int)
+    # 優先度と合算頻度を付与
+    df["prio"] = df["reason"].map(REASON_PRIORITY).fillna(1.0)
+    df["sum_count"] = (
+        pd.to_numeric(df["a_count"], errors="coerce").fillna(0).astype(int) +
+        pd.to_numeric(df["b_count"], errors="coerce").fillna(0).astype(int)
     )
-    tmp["score"] = pd.to_numeric(tmp["score"], errors="coerce").fillna(0.0)
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
 
-    # グループ (a_n, b_n) ごとに「優先度・score・sum_count」の降順で並べ、先頭だけ残す
-    tmp = tmp.sort_values(
+    # （a_n,b_n）グループで最良（prio→score→sum_count の降順）を1件選抜
+    df = df.sort_values(
         ["a_n", "b_n", "prio", "score", "sum_count"],
         ascending=[True, True, False, False, False]
-    )
+    ).drop_duplicates(["a_n", "b_n"], keep="first")
 
-    best = (
-        tmp.drop_duplicates(["a_n", "b_n"], keep="first")
-        .drop(columns=["a_n", "b_n", "prio", "sum_count"], errors="ignore")
-        .reset_index(drop=True)
-    )
-
-    # （元実装どおりの最終並べ替え）
-    best = best.sort_values(["reason", "score", "a", "b"], ascending=[True, False, True, True])
-
-    best = best.drop(columns=["a_n", "b_n", "prio", "sum_count"], errors="ignore")
-    return best.sort_values(["reason", "score", "a", "b"], ascending=[True, False, True, True])
+    # 表示用の最終順
+    df = df.drop(columns=["a_n", "b_n", "prio", "sum_count"], errors="ignore")
+    return df.sort_values(["reason", "score", "a", "b"], ascending=[True, False, True, True]).reset_index(drop=True)
+# --- /REPLACE ---
 
 # ------------------------------------------------------------
 # 変種のグループ化（lemma＋連結成分）→ gid 付与に利用
@@ -2194,8 +2367,9 @@ def build_variation_groups(df_unified: pd.DataFrame, df_lex: Optional[pd.DataFra
 
 # ==== ここから差し替え：2→3分類に拡張（新カテゴリを表示側に追加） ====
 REASON_TO_GROUP = {
-    "basic": "basic",             # ★ 追加
+    "basic": "basic",
     "reading_eq": "reading_eq",
+    "reading_same": "reading_same",  # ★ 追加
     "lemma": "reading",
     "lemma_read": "reading",
     "reading": "reading",
@@ -2203,10 +2377,10 @@ REASON_TO_GROUP = {
     "char": "char",
 }
 
-
 REASON_GROUP_JA = {
-    "basic": "基本一致",                # ★ 追加
+    "basic": "基本一致",
     "reading_eq": "読み一致（英数記号除く）",
+    "reading_same": "読み一致（表記違い）",  # ★ 追加
     "reading": "読み類似",
     "char": "文字類似",
 }
@@ -2414,79 +2588,44 @@ class DiffDialog(QDialog):
         html = self._build_vertical_html(a_text or "", b_text or "")
         self.view.setHtml(html)
 
-    # ===== 差し替えブロック：行番号なし・縦並び・太い帯レール付き =====
+    # --- REPLACE: DiffDialog._build_vertical_html (HTMLエスケープ修正 & 最小化) ---
     def _build_vertical_html(self, a: str, b: str) -> str:
-        import difflib
-
-        a_lines = a.splitlines()
-        b_lines = b.splitlines()
+        import difflib, html
+        a_lines = (a or "").splitlines()
+        b_lines = (b or "").splitlines()
         sm = difflib.SequenceMatcher(a=a_lines, b=b_lines)
         ops = sm.get_opcodes()
 
-        # --- CSSだけ差し替え：タイトル下のアキを徹底的に詰める（レール版） ---
         css = """
         <style>
         html, body, div, p { margin:0; padding:0; }
         body {
-            font-family:'Yu Gothic UI','Noto Sans JP',sans-serif;
-            color:#111; font-size:16px; line-height:1.80; letter-spacing:0.2px;
+        font-family:'Yu Gothic UI','Noto Sans JP',sans-serif;
+        color:#111; font-size:16px; line-height:1.80; letter-spacing:0.2px;
         }
-
-        /* ページ上下の余白は最小限に */
         .page { padding-top:6px; padding-bottom:0; }
-
-        /* セクションの下余白は少なめ、最後はゼロ */
-        .sec  { margin:0 0 6px 0; }
-        .sec:last-child { margin-bottom:0; }
-
-        /* ★Bブロックの前だけスペース（必要量をここで調整） */
-        .sec-b { margin-top:12px; }  /* 8～16pxあたりがおすすめ */
-
-        /* ◀ 見出し行：行高を低め＋下マージン0で“見出し直下のアキ”を詰める */
-        .sec-head {
-            font-weight:600;
-            margin:0;                /* ← 下マージン0に */
-            line-height:0;        /* ← 行高を小さめに */
-        }
+        .sec { margin:0 0 6px 0; } .sec:last-child { margin-bottom:0; }
+        .sec-b { margin-top:12px; }
+        .sec-head { font-weight:600; margin:0; line-height:0; }
         .sec-a .sec-head { color:#d9480f; }
         .sec-b .sec-head { color:#1c7ed6; }
-
-        /* ▼ グレー背景や外枠は使わず、レール＋本文だけで構成 */
-        .diff {
-            line-height:1.00;
-        }
-
-        /* レイアウトはテーブル（QTextEditで安定） */
-        table, .wrap { border-collapse:collapse; border-spacing:0; margin:0; }
+        .diff { line-height:1.00; }
+        table,.wrap { border-collapse:collapse; border-spacing:0; margin:0; }
         .wrap { width:100%; }
-
-        /* ★レール（帯）の太さ：ここで調整（例：18px） */
-        .rail   { width:18px; }
-        .rail-a { background:#fa5252; }
-        .rail-b { background:#4dabf7; }
-
-        /* 本文側の余白：上だけさらに詰めるなら padding-top を小さく */
-        .body { padding:4px 10px 6px 10px; }  /* ← 上4pxにして見出し直下をタイトに */
-
-        /* 各行の内側余白（まだ広く感じるなら 1px に） */
+        .rail { width:18px; }
+        .rail-a { background:#fa5252; } .rail-b { background:#4dabf7; }
+        .body { padding:4px 10px 6px 10px; }
         .line { white-space:pre-wrap; padding:2px 4px; }
-
-        /* 行の種別背景 */
-        .eq  {}
-        .add { background:#e7f5ff; }
-        .del { background:#fff0f0; }
-        .rep { background:#fff7e6; }
-
-        /* 文字単位ハイライト */
-        .tok-ins { color:#1c7ed6; background:#d0ebff; border-radius:2px; }
-        .tok-del { color:#c92a2a; background:#ffe3e3; border-radius:2px; }
+        .eq{} .add{ background:#e7f5ff; } .del{ background:#fff0f0; } .rep{ background:#fff7e6; }
+        .tok-ins{ color:#1c7ed6; background:#d0ebff; border-radius:2px; }
+        .tok-del{ color:#c92a2a; background:#ffe3e3; border-radius:2px; }
         </style>
         """
 
         def esc(s: str) -> str:
-            return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            return html.escape(s or "", quote=False)
 
-        def token_diff_for_A(a_line: str, b_line: str) -> str:
+        def tok_a(a_line: str, b_line: str) -> str:
             sm2 = difflib.SequenceMatcher(a=a_line or "", b=b_line or "")
             parts = []
             for op, i1, i2, j1, j2 in sm2.get_opcodes():
@@ -2494,17 +2633,12 @@ class DiffDialog(QDialog):
                 b_seg = (b_line or "")[j1:j2]
                 if op == "equal":
                     parts.append(esc(a_seg))
-                elif op == "delete":
-                    if a_seg:
-                        parts.append(f"<span class='tok-del'>{esc(a_seg)}</span>")
-                elif op == "insert":
-                    pass
-                elif op == "replace":
+                elif op in ("delete", "replace"):
                     if a_seg:
                         parts.append(f"<span class='tok-del'>{esc(a_seg)}</span>")
             return "".join(parts)
 
-        def token_diff_for_B(a_line: str, b_line: str) -> str:
+        def tok_b(a_line: str, b_line: str) -> str:
             sm2 = difflib.SequenceMatcher(a=a_line or "", b=b_line or "")
             parts = []
             for op, i1, i2, j1, j2 in sm2.get_opcodes():
@@ -2512,30 +2646,23 @@ class DiffDialog(QDialog):
                 b_seg = (b_line or "")[j1:j2]
                 if op == "equal":
                     parts.append(esc(b_seg))
-                elif op == "delete":
-                    pass
-                elif op == "insert":
-                    if b_seg:
-                        parts.append(f"<span class='tok-ins'>{esc(b_seg)}</span>")
-                elif op == "replace":
+                elif op in ("insert", "replace"):
                     if b_seg:
                         parts.append(f"<span class='tok-ins'>{esc(b_seg)}</span>")
             return "".join(parts)
 
-        # Aブロック（上）
         a_rows = [
             "<div class='page sec sec-a'>",
             "<div class='diff'>",
             "<table class='wrap' cellspacing='0' cellpadding='0'><tr>",
-            "<td class='rail rail-a'></td>",            # ← 太い帯のセル
+            "<td class='rail rail-a'></td>",
             "<td class='body'>"
         ]
-        # Bブロック（下）
         b_rows = [
             "<div class='page sec sec-b'>",
             "<div class='diff'>",
             "<table class='wrap' cellspacing='0' cellpadding='0'><tr>",
-            "<td class='rail rail-b'></td>",            # ← 太い帯のセル
+            "<td class='rail rail-b'></td>",
             "<td class='body'>"
         ]
 
@@ -2548,13 +2675,13 @@ class DiffDialog(QDialog):
             elif tag == "delete":
                 for k in range(i2 - i1):
                     a_line = a_lines[i1 + k]
-                    a_rows.append(f"<div class='line del'>{token_diff_for_A(a_line, '')}</div>")
+                    a_rows.append(f"<div class='line del'>{tok_a(a_line, '')}</div>")
                 for _ in range(i2 - i1):
                     b_rows.append("<div class='line del'></div>")
             elif tag == "insert":
                 for k in range(j2 - j1):
                     b_line = b_lines[j1 + k]
-                    b_rows.append(f"<div class='line add'>{token_diff_for_B('', b_line)}</div>")
+                    b_rows.append(f"<div class='line add'>{tok_b('', b_line)}</div>")
                 for _ in range(j2 - j1):
                     a_rows.append("<div class='line add'></div>")
             elif tag == "replace":
@@ -2562,22 +2689,17 @@ class DiffDialog(QDialog):
                 for k in range(h):
                     a_line = a_lines[i1 + k] if (i1 + k) < i2 else ""
                     b_line = b_lines[j1 + k] if (j1 + k) < j2 else ""
-                    a_rows.append(f"<div class='line rep'>{token_diff_for_A(a_line, b_line) if a_line != '' else ''}</div>")
-                    b_rows.append(f"<div class='line rep'>{token_diff_for_B(a_line, b_line) if b_line != '' else ''}</div>")
+                    a_rows.append(f"<div class='line rep'>{tok_a(a_line, b_line) if a_line != '' else ''}</div>")
+                    b_rows.append(f"<div class='line rep'>{tok_b(a_line, b_line) if b_line != '' else ''}</div>")
 
-        # クローズ
         a_rows += ["</td></tr></table>", "</div>", "</div>"]
         b_rows += ["</td></tr></table>", "</div>", "</div>"]
-
-        html = f"<html><head>{css}</head><body>{''.join(a_rows)}{''.join(b_rows)}</body></html>"
-        return html
-    # ===== 差し替えブロックおわり =====
-
+        return f"<html><head>{css}</head><body>{''.join(a_rows)}{''.join(b_rows)}</body></html>"
+    # --- /REPLACE ---
 # ------------------------------------------------------------
 # Qt Models / Delegate / Style / Proxy
 # ------------------------------------------------------------
 # ===== ツールチップ遅延表示フィルタ（完全版：差し替え用） =====
-from typing import Optional
 from PySide6.QtCore import QObject, QTimer, QPoint, QEvent, Qt, QModelIndex
 from PySide6.QtWidgets import QToolTip, QTableView
 from PySide6.QtGui import QHelpEvent
@@ -2719,30 +2841,6 @@ class UnifiedModel(QAbstractTableModel):
                     return str(v)
             return str(v)
 
-        # ツールチップ：a / b 列だけ簡易差分HTML（A上/B下）
-        if role == Qt.ToolTipRole:
-            if c == 0:
-                return None
-            if not self._col_idx:
-                self._col_idx = {name: i for i, name in enumerate(self._df.columns)}
-            col_name = self._df.columns[c - 1]
-            if col_name in ("a", "b"):
-                idx_a = self._col_idx.get("a"); idx_b = self._col_idx.get("b")
-                if idx_a is None or idx_b is None:
-                    return None
-                a_val = self._df.iat[r, idx_a]
-                b_val = self._df.iat[r, idx_b]
-                a_s = "" if a_val is None else str(a_val)
-                b_s = "" if b_val is None else str(b_val)
-                # ★ 長過ぎる場合は生成しない（軽量化）
-                if (len(a_s) + len(b_s)) > 200:
-                    return None
-                try:
-                    return html_quick_ab_diff(a_s, b_s)
-                except Exception:
-                    return None
-            return None
-
         # 行背景（gidによる着色）
         if role == Qt.BackgroundRole:
             try:
@@ -2856,6 +2954,7 @@ class UnifiedFilterProxy(QSortFilterProxyModel):
         self._hide_prefix_edge = False
         self._hide_suffix_edge = False
         self._hide_numeric_only = False
+        self._hide_contains = False   # 内包関係除外
         # ▼ 新規：短文（aの文字数）フィルタ
         self._hide_short_enabled = False
         self._hide_short_len = 0
@@ -3028,6 +3127,19 @@ class UnifiedFilterProxy(QSortFilterProxyModel):
             if a_len is not None and a_len <= self._hide_short_len:
                 return False
 
+        # 4.7) ▼ 新規：内包関係除外（a ∈ b もしくは b ∈ a）
+        if self._hide_contains:
+            ca, cb = self._col("a"), self._col("b")
+            if ca >= 0 and cb >= 0:
+                a_txt = m.data(m.index(row, ca, parent), Qt.DisplayRole) or ""
+                b_txt = m.data(m.index(row, cb, parent), Qt.DisplayRole) or ""
+                # NFKC正規化 + 小文字化で安定判定（全角/半角・ケース差を吸収）
+                sa = nfkc(str(a_txt)).lower()
+                sb = nfkc(str(b_txt)).lower()
+                # 完全一致は“内包”から除外（== は隠さない）
+                if sa and sb and sa != sb and (sa.find(sb) != -1 or sb.find(sa) != -1):
+                    return False
+
         # 5) 一致要因
         if self._reasons:
             c_reason = self._col("一致要因", "理由", "reason")
@@ -3063,6 +3175,12 @@ class UnifiedFilterProxy(QSortFilterProxyModel):
         s1 = "" if v1 is None else str(v1)
         s2 = "" if v2 is None else str(v2)
         return self._collator.compare(s1, s2) < 0
+
+    # --- 追加: 内包関係除外のオン/オフ ---
+    def setHideContainment(self, hide: bool):
+        self._hide_contains = bool(hide)
+        self.invalidateFilter()
+
 
 # ------------------------------------------------------------
 # Worker（★進捗配分を後半重めに再設計）
@@ -3193,6 +3311,10 @@ class AnalyzerWorker(QObject):
 
             # 88.7%: ★「読み一致で 1.0」は 'basic' に付け替え
             df_unified = reclassify_basic_for_reading_eq(df_unified, eps=0.0005)
+
+            # ★ 追加: 読み一致（表記違い）へ再分類
+            df_unified = reclassify_reading_equal_formdiff(df_unified)
+            df_unified = sanitize_reading_same(df_unified)
 
             # 89%: 小数第3位に丸め（念のため整合）
             if df_unified is not None and not df_unified.empty and "score" in df_unified.columns:
@@ -3391,33 +3513,65 @@ class DropArea(QTextEdit):
             self.setText("\n".join(files)); self.filesChanged.emit(files)
         e.acceptProposedAction()
 
+# =========================================================
+# MainWindow（まるごと差し替え）
+# =========================================================
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("PDF 表記ゆれチェック [ver.1.30]"); self.resize(1180, 860)
-        central = QWidget(); self.setCentralWidget(central)
-        root = QHBoxLayout(central)
+        super().__init__()
+        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.40]")
+        self.resize(1180, 860)
 
-        # ---- 左パネル（固定幅 280px）----
-        left_panel = QWidget(); left_panel.setFixedWidth(280)
+        # ---- レイアウト骨格 ----
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ========== 左パネル ==========
+        left_panel = QWidget()
+        left_panel.setFixedWidth(280)
         left = QVBoxLayout(left_panel)
         left.setContentsMargins(8, 8, 8, 8)
         left.setSpacing(8)
 
-        gb_files = QGroupBox("入力PDF"); v_files = QVBoxLayout(gb_files)
-        self.drop = DropArea(); v_files.addWidget(self.drop)
-        row = QHBoxLayout(); self.btn_browse = QPushButton("ファイルを選択"); self.btn_clear = QPushButton("クリア")
-        row.addWidget(self.btn_browse); row.addWidget(self.btn_clear); v_files.addLayout(row)
-        self.list_files = QListWidget(); self.lbl_count = QLabel("選択ファイル：0 件")
-        v_files.addWidget(self.list_files); v_files.addWidget(self.lbl_count)
+        # 入力PDF
+        gb_files = QGroupBox("入力PDF")
+        v_files = QVBoxLayout(gb_files)
+        self.drop = DropArea()
+        v_files.addWidget(self.drop)
+        row = QHBoxLayout()
+        self.btn_browse = QPushButton("ファイルを選択")
+        self.btn_clear = QPushButton("クリア")
+        row.addWidget(self.btn_browse)
+        row.addWidget(self.btn_clear)
+        v_files.addLayout(row)
+        self.list_files = QListWidget()
+        self.lbl_count = QLabel("選択ファイル：0 件")
+        v_files.addWidget(self.list_files)
+        v_files.addWidget(self.lbl_count)
 
-        gb_params = QGroupBox("設定"); form = QFormLayout(gb_params)
-        self.dsb_read = QDoubleSpinBox(); self.dsb_read.setRange(0.0,1.0); self.dsb_read.setSingleStep(0.05); self.dsb_read.setValue(0.90)
-        self.dsb_char = QDoubleSpinBox(); self.dsb_char.setRange(0.0,1.0); self.dsb_char.setSingleStep(0.05); self.dsb_char.setValue(0.85)
-        form.addRow("読み 類似しきい値", self.dsb_read); form.addRow("文字 類似しきい値", self.dsb_char)
+        # 設定
+        gb_params = QGroupBox("設定")
+        form = QFormLayout(gb_params)
+        self.dsb_read = QDoubleSpinBox()
+        self.dsb_read.setRange(0.0, 1.0)
+        self.dsb_read.setSingleStep(0.05)
+        self.dsb_read.setValue(0.90)
+        self.dsb_char = QDoubleSpinBox()
+        self.dsb_char.setRange(0.0, 1.0)
+        self.dsb_char.setSingleStep(0.05)
+        self.dsb_char.setValue(0.85)
+        form.addRow("読み 類似しきい値", self.dsb_read)
+        form.addRow("文字 類似しきい値", self.dsb_char)
 
-        # 下揃えブロック
-        self.btn_run = QPushButton("解析開始"); self.btn_run.setObjectName("btnRun")
-        self.progress = QProgressBar(); self.progress.setRange(0,100); self.progress.setValue(0)
+        # 実行・進捗
+        self.btn_run = QPushButton("解析開始")
+        self.btn_run.setObjectName("btnRun")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self.lbl_stage = QLabel("待機中")
         self.lbl_elapsed = QLabel("経過 00:00")
 
@@ -3429,18 +3583,19 @@ class MainWindow(QMainWindow):
         left.addWidget(self.lbl_stage)
         left.addWidget(self.lbl_elapsed)
 
-        # --- 右パネル（コンパクト配置） ---
-        right_panel = QWidget(); right = QVBoxLayout(right_panel)
+        # ========== 右パネル ==========
+        right_panel = QWidget()
+        right = QVBoxLayout(right_panel)
         right.setContentsMargins(6, 6, 6, 6)
         right.setSpacing(6)
 
-        # ★統合グループ：フィルタ（全文 / 対象 / 一致要因 / 端差 を1つにまとめる）
+        # --- フィルタ群（統合） ---
         gb_filters = QGroupBox("フィルタ")
         v_filters = QVBoxLayout(gb_filters)
         v_filters.setContentsMargins(8, 8, 8, 8)
         v_filters.setSpacing(4)
 
-        # 1) 全文フィルタ行
+        # 1) 全文 ＋ 短文フィルタ
         row_full = QHBoxLayout()
         row_full.setSpacing(8)
         row_full.addWidget(QLabel("全文:"))
@@ -3448,29 +3603,24 @@ class MainWindow(QMainWindow):
         self.ed_filter.setPlaceholderText("絞り込みたい語や表現を入力")
         row_full.addWidget(self.ed_filter, 1)
 
-        # ▼ 追加：短文フィルタ（aの文字数で絞り込み）
         self.chk_shortlen = QCheckBox("字数")
         self.sb_shortlen = QSpinBox()
         self.sb_shortlen.setRange(1, 120)
-        self.sb_shortlen.setValue(3)  # 初期表示
+        self.sb_shortlen.setValue(3)
         lbl_short_suffix = QLabel("以下を隠す")
-
         self.chk_shortlen.setToolTip("a 列の文字数が指定値以下の行を非表示にします。")
         self.sb_shortlen.setToolTip("非表示にする最大文字数（a 列の長さ、1〜120）")
 
-        # 行内に追加（「全文：」と同じ行に並べる）
         row_full.addSpacing(6)
         row_full.addWidget(self.chk_shortlen)
         row_full.addWidget(self.sb_shortlen)
         row_full.addWidget(lbl_short_suffix)
-
         v_filters.addLayout(row_full)
 
-        # 区切り罫
         sep1 = QFrame(); sep1.setFrameShape(QFrame.HLine); sep1.setFrameShadow(QFrame.Sunken)
         v_filters.addWidget(sep1)
 
-        # 2) 対象フィルタ行（語彙/複合語/文節）
+        # 2) 対象（語彙/複合語/文節）
         row_scope = QHBoxLayout(); row_scope.setSpacing(8)
         row_scope.addWidget(QLabel("対　　象:"))
         self.scope_labels = ["語彙", "複合語", "文節"]
@@ -3481,113 +3631,83 @@ class MainWindow(QMainWindow):
         row_scope.addStretch(1)
         v_filters.addLayout(row_scope)
 
-        # 区切り罫
         sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine); sep2.setFrameShadow(QFrame.Sunken)
         v_filters.addWidget(sep2)
 
-        # 3) 一致要因フィルタ行（2分類に集約）
+        # 3) 一致要因
         row_reason = QHBoxLayout(); row_reason.setSpacing(8)
         row_reason.addWidget(QLabel("一致要因:"))
-
-        # 一致要因（表示ラベル）
-        self.reason_labels = ["基本一致", "読み一致（英数記号除く）", "読み類似", "文字類似"]  # ★ 先頭に追加
+        self.reason_labels = [
+            "基本一致",
+            "読み一致（英数記号除く）",
+            "読み一致（表記違い）",
+            "読み類似",
+            "文字類似",
+        ]
         self.chk_reasons: Dict[str, QCheckBox] = {}
         for r in self.reason_labels:
-            cb = QCheckBox(r)
-            cb.setChecked(True)
-            self.chk_reasons[r] = cb
-
+            cb = QCheckBox(r); cb.setChecked(True); self.chk_reasons[r] = cb
             row_reason.addWidget(cb)
         row_reason.addStretch(1)
         v_filters.addLayout(row_reason)
 
-        # 区切り罫
         sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine); sep3.setFrameShadow(QFrame.Sunken)
         v_filters.addWidget(sep3)
 
-        # 4) 端差（前/後1字）フィルタ行（★初期OFF）
-        row_edge = QHBoxLayout()
-        row_edge.setSpacing(8)
+        # 4) 端差/数字以外一致
+        row_edge = QHBoxLayout(); row_edge.setSpacing(8)
         row_edge.addWidget(QLabel("特殊絞込:"))
         self.chk_edge_prefix = QCheckBox("前1文字差を隠す")
         self.chk_edge_suffix = QCheckBox("後1文字差を隠す")
-        # ★追加：数字以外一致
-        self.chk_num_only = QCheckBox("数字以外一致を隠す")
+        self.chk_num_only   = QCheckBox("数字以外一致を隠す")
+        
+        self.chk_contains    = QCheckBox("内包関係除外")
+        self.chk_contains.setChecked(False)
+        self.chk_contains.setToolTip("a/b のどちらかがもう一方を含む行を非表示にします。")
 
-        self.chk_edge_prefix.setChecked(False)  # ★初期OFF
-        self.chk_edge_suffix.setChecked(False)  # ★初期OFF
-        self.chk_num_only.setChecked(False)     # ★初期OFF
-
+        self.chk_edge_prefix.setChecked(False)
+        self.chk_edge_suffix.setChecked(False)
+        self.chk_num_only.setChecked(False)
         self.chk_edge_prefix.setToolTip("「前1字有無」「前1字違い」の候補を表から除外します。")
         self.chk_edge_suffix.setToolTip("「後1字有無」「後1字違い」の候補を表から除外します。")
         self.chk_num_only.setToolTip("数字だけが異なる候補（例: 1時間30分 ↔ 1時間5分）を表から除外します。")
-
         row_edge.addWidget(self.chk_edge_prefix)
         row_edge.addWidget(self.chk_edge_suffix)
-        row_edge.addWidget(self.chk_num_only)   # ★追加
+        row_edge.addWidget(self.chk_num_only)
+        row_edge.addWidget(self.chk_contains)
         row_edge.addStretch(1)
         v_filters.addLayout(row_edge)
 
-
         right.addWidget(gb_filters)
 
-        # テーブルタブ（そのまま）
+        # --- タブ＆テーブル ---
         self.tabs = QTabWidget()
+
         self.view_unified = self._make_table()
-        # --- 表の描画を軽くする設定（QTableView 版・行高さ一定） ---
-        from PySide6.QtWidgets import QHeaderView
-
-        # ❶ 行高さを一定に（ユーザーの自動リサイズや内容依存を止める）
+        # 行高固定・折り返しなし・省略表記は右側（ElideRight）
         vh = self.view_unified.verticalHeader()
-        vh.setSectionResizeMode(QHeaderView.Fixed)  # ← 行の高さを固定
-        vh.setDefaultSectionSize(28)  # ← お好みで 28〜36 など
+        vh.setSectionResizeMode(QHeaderView.Fixed)
+        vh.setDefaultSectionSize(28)
+        self.view_unified.setWordWrap(False)
+        self.view_unified.setTextElideMode(Qt.ElideRight)  # ← ElideNoneは使わない
 
-        # ❷ 折り返しを無効化（1行表示）
-        self.view_unified.setWordWrap(False)  # ← ★ここを False に変更
-        self.view_unified.setTextElideMode(Qt.ElideRight)  # 長い場合は「…」で省略
-
-        # ❸ 列ヘッダ側も極端な自動拡張を抑えるなら Interactive を使う
-        # hh = self.view_unified.horizontalHeader()
-        # hh.setSectionResizeMode(QHeaderView.Interactive)
-
-        # ❹ ツールチップ遅延（既存の ToolTipDebouncer を利用）
-        self._tt_debouncer = ToolTipDebouncer(self.view_unified, delay_ms=200, parent=self)
-        self.view_unified.viewport().installEventFilter(self._tt_debouncer)
-
-
-        # ❸ ツールチップ遅延（9-A の ToolTipDebouncer を利用）
-        self._tt_debouncer = ToolTipDebouncer(self.view_unified, delay_ms=200, parent=self)
-        self.view_unified.viewport().installEventFilter(self._tt_debouncer)
-        # --- ここまで ---
-
-        self.view_unified.setColumnWidth(0, 32)
-        self.view_unified.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.view_unified.setItemDelegateForColumn(0, CheckBoxDelegate(self.view_unified))
-        self.view_unified.setTextElideMode(Qt.ElideNone)
-
-        # 右クリックメニュー（差分表示のみ）
+        # 右クリックメニュー（差分表示）
         self.view_unified.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view_unified.customContextMenuRequested.connect(self.on_unified_context_menu)
 
         self.view_tokens = self._make_table_simple()
+
         self.tabs.addTab(self.view_unified, "表記ゆれ候補")
         self.tabs.addTab(self.view_tokens, "候補（トークン）")
-
-        # ★テーブルを優先的に広げる
         right.addWidget(self.tabs, 1)
 
-        # 操作行（下部のボタン類）
+        # --- 下部操作 ---
         ops = QHBoxLayout()
         self.btn_select_all = QPushButton("すべて選択")
-        self.btn_clear_sel = QPushButton("すべて解除")
-        self.btn_export = QPushButton("Excelエクスポート")
-        self.btn_mark = QPushButton("PDFにマーキング")
-
-        ops.addWidget(self.btn_select_all)
-        ops.addWidget(self.btn_clear_sel)
-        ops.addStretch(1)
-
-        # ▼ 置き換え：リンク風の「ヘルプ」ボタン（CSVエクスポートの左に配置）
+        self.btn_clear_sel  = QPushButton("すべて解除")
+        self.btn_export     = QPushButton("Excelエクスポート")
+        self.btn_mark       = QPushButton("PDFにマーキング")
+        # リンク風ヘルプボタン
         help_url = (
             "https://itpcojp-my.sharepoint.com/:b:/g/personal/masahiro_tanaka_itp_co_jp/"
             "Ec84iGbfkvRFl4ZHhK-XR9YBcjDRoWvi6cf3XX59l2sBzg?e=qvFOZP"
@@ -3595,68 +3715,57 @@ class MainWindow(QMainWindow):
         self.btn_help = QPushButton("ヘルプ")
         self.btn_help.setFlat(True)
         self.btn_help.setCursor(Qt.PointingHandCursor)
-        # リンク風の見た目（青＋ホバーで下線）
         self.btn_help.setStyleSheet("""
             QPushButton { color:#1c7ed6; background:transparent; border:none; padding:0 4px; }
             QPushButton:hover { text-decoration: underline; }
         """)
         self.btn_help.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(help_url)))
-        ops.addWidget(self.btn_help)
 
+        ops.addWidget(self.btn_select_all)
+        ops.addWidget(self.btn_clear_sel)
+        ops.addStretch(1)
+        ops.addWidget(self.btn_help)
         ops.addSpacing(8)
         ops.addWidget(self.btn_export)
         ops.addWidget(self.btn_mark)
-
         right.addLayout(ops)
 
+        # ルートへ追加
         root.addWidget(left_panel)
         root.addWidget(right_panel)
         root.setStretch(0, 0)
         root.setStretch(1, 1)
 
-        # models & proxies
-        self.model_unified = UnifiedModel(); self.model_tokens = PandasModel()
-        self.proxy_unified = UnifiedFilterProxy(); self.proxy_unified.setSourceModel(self.model_unified)
-        self.proxy_tokens = QSortFilterProxyModel(); self.proxy_tokens.setSourceModel(self.model_tokens)
-        self.view_unified.setModel(self.proxy_unified); self.view_tokens.setModel(self.proxy_tokens)
+        # ---- Model / Proxy ----
+        self.model_unified = UnifiedModel()
+        self.model_tokens  = PandasModel()
+        self.proxy_unified = UnifiedFilterProxy()
+        self.proxy_unified.setSourceModel(self.model_unified)
+        self.proxy_tokens = QSortFilterProxyModel()
+        self.proxy_tokens.setSourceModel(self.model_tokens)
         self.proxy_tokens.setFilterCaseSensitivity(Qt.CaseInsensitive)
-        self.proxy_tokens.setFilterKeyColumn(1) # 0:type, 1:token, 2:count
+        self.proxy_tokens.setFilterKeyColumn(1)  # tokens: 0:type, 1:token, 2:count
 
-        # signals
+        self.view_unified.setModel(self.proxy_unified)
+        self.view_tokens.setModel(self.proxy_tokens)
+
+        # ---- Signals ----
         self.drop.filesChanged.connect(self.on_files_changed)
-        self.btn_browse.clicked.connect(self.on_browse); self.btn_clear.clicked.connect(self.on_clear_files)
+        self.btn_browse.clicked.connect(self.on_browse)
+        self.btn_clear.clicked.connect(self.on_clear_files)
         self.btn_run.clicked.connect(self.on_run)
-        self.ed_filter.textChanged.connect(self.on_text_filter_changed)
 
-        # ... 既存のシグナル接続の後ろに追記 ...
+        self.ed_filter.textChanged.connect(self.on_text_filter_changed)
         self.chk_shortlen.stateChanged.connect(self.on_shortlen_filter_changed)
         self.sb_shortlen.valueChanged.connect(self.on_shortlen_filter_changed)
-
-        # 初期反映（未チェック／値はUIに合わせる）
-        self.proxy_unified.setHideShortEnabled(self.chk_shortlen.isChecked())
-        self.proxy_unified.setHideShortLength(self.sb_shortlen.value())
-
-
         for cb in self.chk_reasons.values():
             cb.stateChanged.connect(self.on_reason_changed)
         for cb in self.chk_scopes.values():
             cb.stateChanged.connect(self.on_scope_changed)
-
-        # ★統合フィルタ：端差（前/後）変更
         self.chk_edge_prefix.stateChanged.connect(self.on_edge_filter_changed)
         self.chk_edge_suffix.stateChanged.connect(self.on_edge_filter_changed)
-        self.chk_num_only.stateChanged.connect(self.on_edge_filter_changed)  # ★追加
-
-        # ★端差初期状態（OFF）を明示反映
-        self.proxy_unified.setHidePrefixEdge(self.chk_edge_prefix.isChecked())  # False
-        self.proxy_unified.setHideSuffixEdge(self.chk_edge_suffix.isChecked())  # False
-        self.proxy_unified.setHideNumericOnly(self.chk_num_only.isChecked())    # ★False
-        self._t0: Optional[float] = None
-        self._timer = QTimer(self); self._timer.setInterval(250); self._timer.timeout.connect(self._update_elapsed)
-        self.df_groups = pd.DataFrame()
-        self.surf2gid: Dict[str, int] = {}
-        self.gid2members: Dict[int, List[str]] = {}
-        self._refresh_candidate_count()
+        self.chk_num_only.stateChanged.connect(self.on_edge_filter_changed)
+        self.chk_contains.stateChanged.connect(self.on_edge_filter_changed)
 
         self.btn_select_all.clicked.connect(lambda: self.model_unified.check_all(True))
         self.btn_clear_sel.clicked.connect(lambda: self.model_unified.check_all(False))
@@ -3664,95 +3773,176 @@ class MainWindow(QMainWindow):
         self.btn_mark.clicked.connect(self.on_mark_pdf)
         self.btn_export.clicked.connect(self.on_export)
 
+        # ---- 状態系 ----
         self.files: List[str] = []
-        self.proxy_unified.setScopeFilter(self._selected_scopes())
-        self.proxy_unified.setReasonFilter(self._selected_reasons())
-
-        # ★新規：端差（前/後）既定状態をProxyへ反映
-        self.proxy_unified.setHidePrefixEdge(self.chk_edge_prefix.isChecked())
-        self.proxy_unified.setHideSuffixEdge(self.chk_edge_suffix.isChecked())
-
         self._t0: Optional[float] = None
-        self._timer = QTimer(self); self._timer.setInterval(250); self._timer.timeout.connect(self._update_elapsed)
+        self._timer = QTimer(self)
+        self._timer.setInterval(250)
+        self._timer.timeout.connect(self._update_elapsed)
+
         self.df_groups = pd.DataFrame()
         self.surf2gid: Dict[str, int] = {}
         self.gid2members: Dict[int, List[str]] = {}
+
+        # 初期フィルタ状態（重複初期化を排除）
+        self._init_filter_state_once()
         self._refresh_candidate_count()
 
-    def _post_show_tweaks(self):
-        # 最初の描画完了後にごく軽い微調整だけ行う
-        try:
-            self._ensure_ab_visible(min_a=220, min_b=220)
-        except Exception:
-            pass
-
-    # ---- ユーティリティ ----
-    def _make_table(self):
+    # =========================================================
+    # 小ユーティリティ
+    # =========================================================
+    def _make_table(self) -> QTableView:
         tv = QTableView()
-        tv.setSortingEnabled(True); tv.setAlternatingRowColors(True)
-        tv.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        tv.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        tv.verticalHeader().setVisible(False); tv.verticalHeader().setDefaultSectionSize(28)
-        tv.horizontalHeader().setStretchLastSection(True); tv.horizontalHeader().setHighlightSections(False)
+        tv.setSortingEnabled(True)
+        tv.setAlternatingRowColors(True)
+        tv.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tv.setSelectionMode(QAbstractItemView.SingleSelection)
+        tv.verticalHeader().setVisible(False)
+        tv.verticalHeader().setDefaultSectionSize(28)
+        tv.horizontalHeader().setStretchLastSection(True)
+        tv.horizontalHeader().setHighlightSections(False)
         tv.setShowGrid(True)
         return tv
-    def _make_table_simple(self):
+
+    def _make_table_simple(self) -> QTableView:
         return self._make_table()
 
-    def _ensure_ab_visible(self, min_a=220, min_b=220):
-        df = getattr(self.model_unified, "_df", pd.DataFrame())
-        if df.empty: return
-        cols = list(df.columns)
-        try:
-            idx_a = cols.index("a"); idx_b = cols.index("b")
-        except ValueError:
-            return
-        view_idx_a = 1 + idx_a  # 先頭にチェック列があるため +1
-        view_idx_b = 1 + idx_b
-        self.view_unified.setColumnWidth(view_idx_a, max(self.view_unified.columnWidth(view_idx_a), min_a))
-        self.view_unified.setColumnWidth(view_idx_b, max(self.view_unified.columnWidth(view_idx_b), min_b))
+    def _init_filter_state_once(self):
+        # Proxy 初期状態の一括反映
+        self.proxy_unified.setScopeFilter(self._selected_scopes())
+        self.proxy_unified.setReasonFilter(self._selected_reasons())
+        self.proxy_unified.setHidePrefixEdge(self.chk_edge_prefix.isChecked())
+        self.proxy_unified.setHideSuffixEdge(self.chk_edge_suffix.isChecked())
+        self.proxy_unified.setHideNumericOnly(self.chk_num_only.isChecked())
+        self.proxy_unified.setHideShortEnabled(self.chk_shortlen.isChecked())
+        self.proxy_unified.setHideShortLength(self.sb_shortlen.value())
+        self.proxy_unified.setHideContainment(self.chk_contains.isChecked())
 
-    # ---- 進捗・件数 ----
+    def _selected_scopes(self) -> Set[str]:
+        return {k for k, cb in self.chk_scopes.items() if cb.isChecked()}
+
+    def _selected_reasons(self) -> Set[str]:
+        # GUI表示ラベル → apply_reason_ja() 後の「一致要因」列の値と一致
+        return {k for k, cb in self.chk_reasons.items() if cb.isChecked()}
+
     def _update_elapsed(self):
         if self._t0 is None:
-            self.lbl_elapsed.setText("経過 00:00"); return
+            self.lbl_elapsed.setText("経過 00:00")
+            return
         sec = max(0, int(time.monotonic() - self._t0))
-        h, rem = divmod(sec, 3600); m, s = divmod(rem, 60)
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
         fmt = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         self.lbl_elapsed.setText(f"経過 {fmt}")
 
     def _refresh_candidate_count(self):
         try:
-            df_unified = getattr(self.model_unified, "_df", pd.DataFrame())
-            total = int(df_unified.shape[0]) if isinstance(df_unified, pd.DataFrame) else 0
+            df_u = getattr(self.model_unified, "_df", pd.DataFrame())
+            total = int(df_u.shape[0]) if isinstance(df_u, pd.DataFrame) else 0
             visible = int(self.proxy_unified.rowCount())
             self.tabs.setTabText(0, f"表記ゆれ候補[{visible:,}/{total:,}]")
         except Exception:
             self.tabs.setTabText(0, "表記ゆれ候補[0/0]")
 
-    # ---- DnD & 入出力 ----
-    def on_files_changed(self, files: List[str]): self.set_files(files)
+    def _cap_ab_widths(self, min_a=220, max_a=320, min_b=220, max_b=320):
+        # a/b 列の幅を上限クリップ
+        df = getattr(self.model_unified, "_df", pd.DataFrame())
+        if df.empty:
+            return
+        cols = list(df.columns)
+        try:
+            idx_a = cols.index("a")
+            idx_b = cols.index("b")
+        except ValueError:
+            return
+        va = 1 + idx_a  # 先頭のチェック列があるので +1
+        vb = 1 + idx_b
+        hdr = self.view_unified.horizontalHeader()
+        hdr.setSectionResizeMode(va, QHeaderView.Interactive)
+        hdr.setSectionResizeMode(vb, QHeaderView.Interactive)
+        w = self.view_unified.columnWidth
+        self.view_unified.setColumnWidth(va, min(max_a, max(min_a, w(va))))
+        self.view_unified.setColumnWidth(vb, min(max_b, max(min_b, w(vb))))
+
+    def _hide_aux_columns(self):
+        # 表示を軽くするため補助列を隠す（存在チェック付き）
+        view = self.view_unified
+        model = view.model()  # proxy
+        if not model:
+            return
+        names_hide = {"端差", "数字以外一致"}  # 必要に応じて追加
+        hdr = view.horizontalHeader()
+        for c in range(model.columnCount()):
+            name = (model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "").strip()
+            if name in names_hide:
+                hdr.setSectionResizeMode(c, QHeaderView.Fixed)
+                view.setColumnHidden(c, True)
+
+    def _compact_columns(self):
+        view = self.view_unified
+        model = view.model()
+        if not model:
+            return
+        hdr = view.horizontalHeader()
+        hdr.setMinimumSectionSize(40)
+        NUMERIC = {"gid", "字数", "a_count", "b_count", "a数", "b数", "score", "類似度"}
+        LABELS = {"一致要因", "理由", "対象", "scope", "target"}
+        for c in range(model.columnCount()):
+            name = (model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "").strip()
+            if name in {"a", "b"}:
+                hdr.setSectionResizeMode(c, QHeaderView.Interactive)
+                continue
+            if name in NUMERIC:
+                max_w = 88 if name not in {"gid", "字数"} else 72
+            elif name in LABELS:
+                max_w = 120
+            else:
+                max_w = 160
+            w = view.columnWidth(c)
+            view.setColumnWidth(c, min(max_w, w if w > 0 else max_w))
+            hdr.setSectionResizeMode(c, QHeaderView.Interactive)
+
+    # =========================================================
+    # DnD & 入出力
+    # =========================================================
+    def on_files_changed(self, files: List[str]):
+        self.set_files(files)
+
     def set_files(self, files: List[str]):
-        self.files = files; self.list_files.clear()
-        for f in files: self.list_files.addItem(f)
+        self.files = files
+        self.list_files.clear()
+        for f in files:
+            self.list_files.addItem(f)
         self.lbl_count.setText(f"選択ファイル：{len(files)} 件")
+
     def on_browse(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "PDFを選択", "", "PDF Files (*.pdf)")
-        if paths: self.set_files(paths)
+        if paths:
+            self.set_files(paths)
+
     def on_clear_files(self):
-        self.set_files([]); self.drop.clear()
+        self.set_files([])
+        self.drop.clear()
 
     def on_run(self):
         if not self.files:
-            QMessageBox.warning(self, "注意", "PDFを指定してください。"); return
-        if not HAS_MECAB:
-            QMessageBox.critical(self, "エラー",
-                'MeCab (fugashi/unidic-lite) が必要です。\n'
-                'インストール例: pip install "fugashi[unidic-lite]"')
+            QMessageBox.warning(self, "注意", "PDFを指定してください。")
             return
-        self.btn_run.setEnabled(False); self.progress.setValue(0)
-        self._t0 = time.monotonic(); self._update_elapsed(); self._timer.start()
+        if not HAS_MECAB:
+            QMessageBox.critical(
+                self, "エラー",
+                'MeCab (fugashi/unidic-lite) が必要です。\n'
+                'インストール例: pip install "fugashi[unidic-lite]"'
+            )
+            return
+
+        self.btn_run.setEnabled(False)
+        self.progress.setValue(0)
+        self._t0 = time.monotonic()
+        self._update_elapsed()
+        self._timer.start()
         self.lbl_stage.setText("開始")
+
         self.thread = QThread()
         self.worker = AnalyzerWorker(self.files, True, self.dsb_read.value(), self.dsb_char.value())
         self.worker.moveToThread(self.thread)
@@ -3773,15 +3963,14 @@ class MainWindow(QMainWindow):
             return
 
         self.lbl_stage.setText("集計完了（表示中…）")
+
         df_unified = results.get("unified", pd.DataFrame())
         self.df_groups = results.get("groups", pd.DataFrame())
         self.surf2gid = results.get("surf2gid", {}) or {}
         self.gid2members = results.get("gid2members", {}) or {}
 
         if not df_unified.empty:
-            # Worker 側で 'gid' と '字数' を付与済み想定
             df_u = df_unified.copy()
-
             cols = list(df_u.columns)
             pref = [c for c in ["gid", "字数", "a", "b"] if c in cols]
             rest = [c for c in cols if c not in pref]
@@ -3791,72 +3980,50 @@ class MainWindow(QMainWindow):
 
         self.model_unified.setDataFrame(df_u)
         self.model_tokens.setDataFrame(results.get("tokens", pd.DataFrame()))
-        # 反映中は再描画＆並び替えを止める
+
+        # テーブル調整（再描画負荷を抑えつつ）
         self.view_unified.setUpdatesEnabled(False)
         self.view_unified.setSortingEnabled(False)
-
-        # 列幅は「a/b だけ軽く自動→すぐに上限クリップ」
-        # self.view_unified.resizeColumnsToContents()  # ← 1回でOK（tokens 側はスキップで可）
-        # self.view_tokens.resizeColumnsToContents() は呼ばない or 後回し
-
-        # a/b 列の最小・最大幅で固定
         self._cap_ab_widths(min_a=220, max_a=320, min_b=220, max_b=320)
-
-        # 補助列の非表示
         self._hide_aux_columns()
         self._ensure_ab_visible(min_a=220, min_b=220)
-
         self._compact_columns()
         self.view_unified.setSortingEnabled(True)
         self.view_unified.setUpdatesEnabled(True)
 
         self._refresh_candidate_count()
         QApplication.processEvents()
-
         self.progress.setValue(100)
         self.lbl_stage.setText("完了")
-        if self._timer.isActive(): self._timer.stop()
+        if self._timer.isActive():
+            self._timer.stop()
 
-    def _compact_columns(self):
-        view = self.view_unified
-        model = view.model()  # Proxy
-        if not model:
+    def _ensure_ab_visible(self, min_a=220, min_b=220):
+        df = getattr(self.model_unified, "_df", pd.DataFrame())
+        if df.empty:
             return
-        hdr = view.horizontalHeader()
-        hdr.setMinimumSectionSize(40)  # 小さめOKに
+        cols = list(df.columns)
+        try:
+            idx_a = cols.index("a")
+            idx_b = cols.index("b")
+        except ValueError:
+            return
+        va = 1 + idx_a  # 先頭チェック列があるため +1
+        vb = 1 + idx_b
+        self.view_unified.setColumnWidth(va, max(self.view_unified.columnWidth(va), min_a))
+        self.view_unified.setColumnWidth(vb, max(self.view_unified.columnWidth(vb), min_b))
 
-        NUMERIC_NAMES = {"gid", "字数", "a_count", "b_count", "a数", "b数", "score", "類似度"}
-        LABEL_NAMES   = {"一致要因", "理由", "対象", "scope", "target"}
-
-        for c in range(model.columnCount()):
-            name = model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
-            name = (name or "").strip()
-
-            # 目安の最大幅
-            if name in NUMERIC_NAMES:
-                max_w = 88 if name not in {"gid", "字数"} else 72
-            elif name in LABEL_NAMES:
-                max_w = 120
-            elif name in {"a", "b"}:
-                # a/b は専用の _cap_ab_widths で処理するのでスキップ
-                hdr.setSectionResizeMode(c, QHeaderView.Interactive)
-                continue
-            else:
-                max_w = 160
-
-            # 現在幅を上限でクリップ
-            w = view.columnWidth(c)
-            view.setColumnWidth(c, min(max_w, w if w > 0 else max_w))
-            hdr.setSectionResizeMode(c, QHeaderView.Interactive)
-
+    # =========================================================
+    # テーブル操作・メニュー
+    # =========================================================
     def on_unified_clicked(self, proxy_index: QModelIndex):
-        if not proxy_index.isValid() or proxy_index.column() != 0: return
+        if not proxy_index.isValid() or proxy_index.column() != 0:
+            return
         src_index = self.proxy_unified.mapToSource(proxy_index)
         current = self.model_unified.data(src_index, Qt.CheckStateRole)
         new_state = Qt.Unchecked if current == Qt.Checked else Qt.Checked
         self.model_unified.setData(src_index, new_state, Qt.CheckStateRole)
 
-    # ---- 右クリックメニュー（差分表示）----
     def on_unified_context_menu(self, pos: QPoint):
         index = self.view_unified.indexAt(pos)
         if not index.isValid():
@@ -3871,36 +4038,71 @@ class MainWindow(QMainWindow):
         b = df.at[row, "b"] if "b" in df.columns else ""
 
         menu = QMenu(self)
-
-        # 差分表示のみ
         act_diff = QAction("差分を表示…", self)
+
         def _show():
             dlg = DiffDialog(str(a) if a is not None else "", str(b) if b is not None else "", self)
             dlg.exec()
+
         act_diff.triggered.connect(_show)
         menu.addAction(act_diff)
-
         menu.exec(self.view_unified.viewport().mapToGlobal(pos))
 
+    # =========================================================
+    # フィルタ変更ハンドラ
+    # =========================================================
+    def on_text_filter_changed(self, text: str):
+        self.proxy_unified.setTextFilter(text)
+        self.proxy_tokens.setFilterFixedString(text)
+        self._refresh_candidate_count()
+
+    def on_shortlen_filter_changed(self, *_):
+        self.proxy_unified.setHideShortEnabled(self.chk_shortlen.isChecked())
+        self.proxy_unified.setHideShortLength(self.sb_shortlen.value())
+        self._refresh_candidate_count()
+
+    def on_reason_changed(self, *_):
+        self.proxy_unified.setReasonFilter(self._selected_reasons())
+        self._refresh_candidate_count()
+
+    def on_scope_changed(self, *_):
+        self.proxy_unified.setScopeFilter(self._selected_scopes())
+        self._refresh_candidate_count()
+
+    def on_edge_filter_changed(self, *_):
+        self.proxy_unified.setHidePrefixEdge(self.chk_edge_prefix.isChecked())
+        self.proxy_unified.setHideSuffixEdge(self.chk_edge_suffix.isChecked())
+        self.proxy_unified.setHideNumericOnly(self.chk_num_only.isChecked())
+        self.proxy_unified.setHideContainment(self.chk_contains.isChecked())
+        self._refresh_candidate_count()
+
+    # =========================================================
+    # エクスポート / PDFマーキング
+    # =========================================================
+    def _build_unified_df_with_selection_all(self) -> pd.DataFrame:
+        """GUIの選択状態を含めて、全件の DataFrame を返す（Excel用）"""
+        src_df = getattr(self.model_unified, "_df", pd.DataFrame()).copy()
+        checks = list(getattr(self.model_unified, "_checks", []))
+        if src_df.empty:
+            return src_df
+        if len(checks) != len(src_df):
+            checks = [False] * len(src_df)
+        df_all = src_df.reset_index(drop=True)
+        df_all.insert(0, "選択", checks)
+        if "字数" not in df_all.columns and "a" in df_all.columns:
+            df_all["字数"] = df_all["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
+        return df_all
+
     def on_export(self):
-        """
-        Excel（全件データ＋初期フィルタ見た目）を出力。
-        - データは全件
-        - 開いた直後の見た目はGUIと同じ（オートフィルタ宣言＋非該当行を非表示）
-        - xlsxwriter 優先。無ければ openpyxl でも近い見た目
-        - ※「フィルタ設定」シートは出しません
-        """
-        import pandas as pd
+        """Excel（全件データ＋初期フィルタ見た目）を出力"""
         import json, math as _math
 
-        # ---------- 0) 全件DFの取得（「選択」列付き） ----------
         try:
             df_all = self._build_unified_df_with_selection_all()
         except Exception:
             src_df = getattr(self.model_unified, "_df", pd.DataFrame()).copy()
             checks = list(getattr(self.model_unified, "_checks", []))
             if src_df.empty:
-                from PySide6.QtWidgets import QMessageBox
                 QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
                 return
             if len(checks) != len(src_df):
@@ -3910,7 +4112,7 @@ class MainWindow(QMainWindow):
             if "字数" not in df_all.columns and "a" in df_all.columns:
                 df_all["字数"] = df_all["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
 
-        # ---------- 1) Excel安全化（dict/list → JSON、NaN→空） ----------
+        # Excel安全化
         def _sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
             def coerce(v):
                 if v is None: return ""
@@ -3927,53 +4129,38 @@ class MainWindow(QMainWindow):
 
         df_all = _sanitize_df_for_excel(df_all)
 
-        # ---------- 2) 保存パス ----------
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        default_name = "variants_unified.xlsx"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Excelの保存先", default_name, "Excel ファイル (*.xlsx)"
-        )
+        # 保存ダイアログ
+        path, _ = QFileDialog.getSaveFileName(self, "Excelの保存先", "variants_unified.xlsx", "Excel ファイル (*.xlsx)")
         if not path:
             return
 
-        # ---------- 3) エンジン選択（xlsxwriter 優先） ----------
-        try:
-            import xlsxwriter  # noqa
-            engine = "xlsxwriter"
-        except Exception:
-            engine = "openpyxl"
+        # GUIフィルタ状態
+        scopes_on = sorted(list(self._selected_scopes()))
+        reasons_on = sorted(list(self._selected_reasons()))
+        hide_prefix = self.chk_edge_prefix.isChecked()
+        hide_suffix = self.chk_edge_suffix.isChecked()
+        short_on = self.chk_shortlen.isChecked()
+        short_n = int(self.sb_shortlen.value()) if short_on else None
+        fulltext = (self.ed_filter.text() or "").strip()
+        need_full = bool(fulltext)
 
-        # ---------- 4) GUIフィルタ状態 ----------
-        scopes_on  = sorted(list(self._selected_scopes()))  if hasattr(self, "_selected_scopes")  else []
-        reasons_on = sorted(list(self._selected_reasons())) if hasattr(self, "_selected_reasons") else []
-        hide_prefix = bool(getattr(self, "chk_edge_prefix", None) and self.chk_edge_prefix.isChecked())
-        hide_suffix = bool(getattr(self, "chk_edge_suffix", None) and self.chk_edge_suffix.isChecked())
-        short_on    = bool(getattr(self, "chk_shortlen", None) and self.chk_shortlen.isChecked())
-        short_n     = int(self.sb_shortlen.value()) if short_on else None
-        fulltext    = (getattr(self, "ed_filter", None).text() if hasattr(self, "ed_filter") else "") or ""
-        fulltext    = fulltext.strip()
-        need_full   = bool(fulltext)
-
-        # ---------- 5) 許可リスト（Blanks対応）＆ 補助列 ----------
-        BLANK_TOKEN = "Blanks"  # XlsxWriter の特別トークン（"" ではなくこれを使う）
-
-        # 端差
+        # 許可リスト（Blanks対応）
+        BLANK_TOKEN = "Blanks"
         edge_allowed_list, edge_allow_blank = None, False
-        if "端差" in df_all.columns:
+        if "端差" in df_all.columns and (hide_prefix or hide_suffix):
             series = df_all["端差"].astype(str)
             uniq = set(s.strip() for s in series.fillna(""))
             deny = set()
             if hide_prefix: deny |= {"前1字有無", "前1字違い"}
             if hide_suffix: deny |= {"後1字有無", "後1字違い"}
-            edge_allow_blank = ("" in uniq)  # 空セルも見せる（必要に応じて調整）
+            edge_allow_blank = ("" in uniq)
             allowed = [v for v in sorted(uniq) if v and v not in deny]
             if edge_allow_blank:
                 allowed = [BLANK_TOKEN] + allowed
             edge_allowed_list = allowed
 
-        # 数字以外一致
         num_allowed_list, num_allow_blank = None, False
-        if "数字以外一致" in df_all.columns and getattr(self, "chk_num_only", None) and self.chk_num_only.isChecked():
+        if "数字以外一致" in df_all.columns and self.chk_num_only.isChecked():
             series = df_all["数字以外一致"].astype(str)
             uniq = set(s.strip() for s in series.fillna(""))
             num_allow_blank = ("" in uniq)
@@ -3982,126 +4169,130 @@ class MainWindow(QMainWindow):
                 allowed = [BLANK_TOKEN] + allowed
             num_allowed_list = allowed
 
-        # 補助列：全文__concat（contains）
         if need_full:
             cols_for_full = [c for c in ["a", "b", "一致要因", "対象"] if c in df_all.columns]
             df_all["全文__concat"] = (
                 df_all[cols_for_full].astype(str).fillna("").agg(" / ".join, axis=1)
             ) if cols_for_full else ""
 
-        # ---------- 6) 初期表示マスク（True=表示） ----------
+        # --- 追加: 内包関係除外（Excelの初期表示マスクにも反映） ---
+        if self.chk_contains.isChecked() and "a" in df_all.columns and "b" in df_all.columns:
+            def _contains_row(a, b):
+                sa = nfkc(str(a or "")).lower()
+                sb = nfkc(str(b or "")).lower()
+                return (sa and sb and sa != sb and (sa.find(sb) != -1 or sb.find(sa) != -1))
+            mask &= ~df_all.apply(lambda r: _contains_row(r.get("a", ""), r.get("b", "")), axis=1)
+
+
+        # 初期表示マスク（True=表示）
         mask = pd.Series(True, index=df_all.index)
         if scopes_on and "対象" in df_all.columns:
             mask &= df_all["対象"].astype(str).isin(scopes_on)
         if reasons_on and "一致要因" in df_all.columns:
             mask &= df_all["一致要因"].astype(str).isin(reasons_on)
-
         if edge_allowed_list is not None and "端差" in df_all.columns:
             vals = df_all["端差"].astype(str).fillna("")
             nonblank_set = set(v for v in edge_allowed_list if v != BLANK_TOKEN)
             cond_nonblank = vals.str.strip().isin(nonblank_set) if nonblank_set else pd.Series(False, index=vals.index)
-            cond_blank    = vals.str.strip().eq("") if edge_allow_blank else pd.Series(False, index=vals.index)
+            cond_blank = vals.str.strip().eq("") if edge_allow_blank else pd.Series(False, index=vals.index)
             mask &= (cond_nonblank | cond_blank)
-
         if num_allowed_list is not None and "数字以外一致" in df_all.columns:
             vals = df_all["数字以外一致"].astype(str).fillna("")
             nonblank_set = set(v for v in num_allowed_list if v != BLANK_TOKEN)
             cond_nonblank = vals.str.strip().isin(nonblank_set) if nonblank_set else pd.Series(False, index=vals.index)
-            cond_blank    = vals.str.strip().eq("") if num_allow_blank else pd.Series(False, index=vals.index)
+            cond_blank = vals.str.strip().eq("") if num_allow_blank else pd.Series(False, index=vals.index)
             mask &= (cond_nonblank | cond_blank)
-
         if short_on and "字数" in df_all.columns:
             mask &= pd.to_numeric(df_all["字数"], errors="coerce").fillna(0) > short_n
         if need_full and "全文__concat" in df_all.columns:
             mask &= df_all["全文__concat"].astype(str).str.contains(fulltext, case=False, na=False)
 
-        # ---------- 7) 書き出し ----------
+        # エクスポート（xlsxwriter 優先）
+        try:
+            import xlsxwriter  # noqa
+            engine = "xlsxwriter"
+        except Exception:
+            engine = "openpyxl"
+
         try:
             with pd.ExcelWriter(path, engine=engine) as writer:
                 sheet_main = "表記ゆれ候補"
                 df_all.to_excel(writer, index=False, sheet_name=sheet_main)
-
                 nrows, ncols = df_all.shape
 
-                # 列インデックス
                 def col_idx(col_name):
-                    try: return df_all.columns.get_loc(col_name)
-                    except Exception: return None
-                idx_len   = col_idx("字数")
-                idx_reason= col_idx("一致要因")
-                idx_scope = col_idx("対象")
-                idx_edge  = col_idx("端差")
-                idx_num   = col_idx("数字以外一致")
-                idx_full  = col_idx("全文__concat") if need_full else None
+                    try:
+                        return df_all.columns.get_loc(col_name)
+                    except Exception:
+                        return None
+
+                ci_len   = col_idx("字数")
+                ci_reason= col_idx("一致要因")
+                ci_scope = col_idx("対象")
+                ci_edge  = col_idx("端差")
+                ci_num   = col_idx("数字以外一致")
+                ci_full  = col_idx("全文__concat") if need_full else None
 
                 if engine == "xlsxwriter":
                     wb = writer.book
                     ws = writer.sheets[sheet_main]
-
-                    # ❶ フリーズ＋オートフィルタ枠（全件）
                     ws.freeze_panes(1, 1)
                     ws.autofilter(0, 0, nrows, max(0, ncols - 1))
 
-                    # ❷ フィルタ条件の宣言（Blanksは特別トークン）
-                    if idx_scope is not None and scopes_on:
+                    if ci_scope is not None and scopes_on:
                         uniq_scopes = set(str(x) for x in df_all["対象"].dropna().astype(str))
                         if len(scopes_on) < len(uniq_scopes):
-                            ws.filter_column_list(idx_scope, [str(v) for v in scopes_on])
+                            ws.filter_column_list(ci_scope, [str(v) for v in scopes_on])
 
-                    if idx_reason is not None and reasons_on:
+                    if ci_reason is not None and reasons_on:
                         uniq_reasons = set(str(x) for x in df_all["一致要因"].dropna().astype(str))
                         if len(reasons_on) < len(uniq_reasons):
-                            ws.filter_column_list(idx_reason, [str(v) for v in reasons_on])
+                            ws.filter_column_list(ci_reason, [str(v) for v in reasons_on])
 
-                    if idx_edge is not None and edge_allowed_list is not None:
+                    if ci_edge is not None and edge_allowed_list is not None:
                         uniq_edge = set(str(x).strip() for x in df_all["端差"].fillna(""))
                         if 0 < len(edge_allowed_list) < len(uniq_edge) + (1 if edge_allow_blank else 0):
-                            ws.filter_column_list(idx_edge, edge_allowed_list)
+                            ws.filter_column_list(ci_edge, edge_allowed_list)
 
-                    if idx_num is not None and num_allowed_list is not None:
+                    if ci_num is not None and num_allowed_list is not None:
                         uniq_num = set(str(x).strip() for x in df_all["数字以外一致"].fillna(""))
                         if 0 < len(num_allowed_list) < len(uniq_num) + (1 if num_allow_blank else 0):
-                            ws.filter_column_list(idx_num, num_allowed_list)
+                            ws.filter_column_list(ci_num, num_allowed_list)
 
-                    if idx_len is not None and short_on:
-                        ws.filter_column(idx_len, f'x > {short_n}')
+                    if ci_len is not None and short_on:
+                        ws.filter_column(ci_len, f'x > {short_n}')
 
-                    if idx_full is not None and fulltext:
+                    if ci_full is not None and fulltext:
                         def _xf_escape(s: str) -> str:
                             return s.replace('~', '~~').replace('*', '~*').replace('?', '~?')
-                        ws.filter_column(idx_full, f'x == *{_xf_escape(fulltext)}*')
-                        ws.set_column(idx_full, idx_full, None, None, {"hidden": True})
+                        ws.filter_column(ci_full, f"x == *{_xf_escape(fulltext)}*")
+                        ws.set_column(ci_full, ci_full, None, None, {"hidden": True})
 
-                    # ❸ 初期表示で非該当行を非表示（ヘッダ0を除外）
+                    # 非該当行を非表示（ヘッダを除く）
                     for i, ok in enumerate(mask.tolist()):
                         if not ok:
                             ws.set_row(i + 1, None, None, {'hidden': True})
 
-
-                    # ❹ 列幅と書式
-                    num_fmt_int = wb.add_format({"align": "right"})          # 既存の数値右寄せ
-                    num_fmt_3   = wb.add_format({"num_format": "0.000", "align": "right"})  # ★ 3桁小数
-
+                    # 列幅
+                    num_fmt_int = wb.add_format({"align": "right"})
+                    num_fmt_3   = wb.add_format({"num_format": "0.000", "align": "right"})
                     def set_w(name, width, fmt=None):
                         ci = col_idx(name)
                         if ci is not None:
                             ws.set_column(ci, ci, width, fmt)
-
                     set_w("選択", 7)
                     set_w("gid", 7, num_fmt_int)
                     set_w("字数", 6, num_fmt_int)
                     set_w("a", 32); set_w("b", 32)
                     set_w("一致要因", 12); set_w("対象", 10)
                     set_w("端差", 10); set_w("数字以外一致", 12)
-                    set_w("score", 8, num_fmt_3)  # ★ 追加：score を 0.000 で固定
-
+                    set_w("score", 8, num_fmt_3)
 
                 else:
-                    # openpyxl：枠＋B2固定＋非該当行の非表示
                     ws = writer.sheets[sheet_main]
                     try:
                         from openpyxl.utils import get_column_letter
-                        last_row = max(1, nrows + 1)      # ヘッダ込み
+                        last_row = max(1, nrows + 1)
                         last_col = max(1, ncols)
                         ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}{last_row}"
                         ws.freeze_panes = "B2"
@@ -4116,15 +4307,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "エラー", str(e))
 
     def on_mark_pdf(self):
+        """表示中テーブルのチェック済み a/b を PDF にマーキング（既存ロジック準拠）"""
         if not self.files:
-            QMessageBox.warning(self, "注意", "PDFを指定してください。"); return
+            QMessageBox.warning(self, "注意", "PDFを指定してください。")
+            return
         df = getattr(self.model_unified, "_df", pd.DataFrame())
         if df.empty:
-            QMessageBox.information(self, "情報", "マーキング対象がありません。"); return
+            QMessageBox.information(self, "情報", "マーキング対象がありません。")
+            return
 
+        # 選択抽出
         col_a = df.columns.get_indexer(["a"])[0] if "a" in df.columns else -1
         col_b = df.columns.get_indexer(["b"])[0] if "b" in df.columns else -1
-
         raw_targets = []
         for r_proxy in range(self.proxy_unified.rowCount()):
             src_idx = self.proxy_unified.mapToSource(self.proxy_unified.index(r_proxy, 0))
@@ -4141,8 +4335,10 @@ class MainWindow(QMainWindow):
                     if isinstance(b, str) and b:
                         raw_targets.append(("b", b))
         if not raw_targets:
-            QMessageBox.information(self, "情報", "マーキング対象が選択されていません。"); return
+            QMessageBox.information(self, "情報", "マーキング対象が選択されていません。")
+            return
 
+        # 重複整理（a優先）
         by_text = {}
         for kind, text in raw_targets:
             if text not in by_text:
@@ -4160,8 +4356,20 @@ class MainWindow(QMainWindow):
         out_dir = QFileDialog.getExistingDirectory(self, "出力フォルダを選択")
         if not out_dir:
             return
+
+        # 検索の堅牢化（元実装を簡約移植）
         CONN_CHARS = "ー-－–—・/／_＿"
         SPACE_CHARS = {" ", "\u00A0", "\u3000"}
+
+        def nfkc(s: str) -> str:
+            return unicodedata.normalize("NFKC", s)
+
+        def hira_to_kata(s: str) -> str:
+            out = []
+            for ch in s:
+                o = ord(ch)
+                out.append(chr(o + 0x60) if 0x3041 <= o <= 0x3096 else ch)
+            return "".join(out)
 
         def kana_norm_variants(s: str) -> Set[str]:
             base = nfkc(s or ""); k = hira_to_kata(base)
@@ -4171,16 +4379,12 @@ class MainWindow(QMainWindow):
             vs = set(); s0 = s or ""; s1 = nfkc(s0)
             for cand in (s0, s1):
                 if not cand: continue
-                vs.add(cand)
-                vs.add(cand.replace(" ", ""))
-                vs.add(cand.replace(" ", "\u00A0"))
-                vs.add(cand.replace(" ", "\u3000"))
-            for c in list(vs):
-                for ch in CONN_CHARS:
-                    if ch in c:
-                        vs.add(c.replace(ch, ""))
-                        vs.add(c.replace(ch, " "))
-                        vs.add(c.replace(ch, "\u00A0"))
+                vs.add(cand); vs.add(cand.replace(" ", "")); vs.add(cand.replace(" ", "\u00A0")); vs.add(cand.replace(" ", "\u3000"))
+                for ch in list(CONN_CHARS):
+                    if ch in cand:
+                        vs.add(cand.replace(ch, ""))
+                        vs.add(cand.replace(ch, " "))
+                        vs.add(cand.replace(ch, "\u00A0"))
             add = set()
             for c in vs:
                 add |= kana_norm_variants(c)
@@ -4228,17 +4432,15 @@ class MainWindow(QMainWindow):
                                     rr = fitz.Rect(x0 + idx*ch_w, y0, x0 + (idx+1)*ch_w, y1)
                                     chars.append({"orig": c, "rect": rr, "line": line_counter})
                     line_counter += 1
-
             def norm_keep(c: str) -> str:
                 if c in SPACE_CHARS or c in CONN_CHARS: return ""
-                c = nfkc(c); c = hira_to_kata(c)
+                c = hira_to_kata(nfkc(c))
                 if c in SPACE_CHARS or c in CONN_CHARS: return ""
                 return c
             def norm_nochoon(c: str) -> str:
                 s = norm_keep(c)
                 if s == "ー": return ""
                 return s
-
             keep_list, keep_idxmap = [], []
             noch_list, noch_idxmap = [], []
             for i, it in enumerate(chars):
@@ -4285,8 +4487,7 @@ class MainWindow(QMainWindow):
             return uniq
 
         def robust_find_on_page(page, queries: list):
-            chars, (stream_keep, keep_idxmap), (stream_noch, noch_idxmap), used_equal_split = norm_stream_chars(page)
-
+            chars, (stream_keep, keep_idxmap), (stream_noch, noch_idxmap), _ = norm_stream_chars(page)
             qnorm_keep_set, qnorm_noch_set = set(), set()
             for q in queries:
                 for v in base_variants(q):
@@ -4295,7 +4496,6 @@ class MainWindow(QMainWindow):
                     if v_keep: qnorm_keep_set.add(v_keep)
                     v_noch = v_keep.replace("ー", "")
                     if v_noch: qnorm_noch_set.add(v_noch)
-
             stream_hits = []
             for qk in qnorm_keep_set:
                 for s_idx, e_idx in search_stream(stream_keep, keep_idxmap, qk):
@@ -4315,11 +4515,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             search_hits = dedup(search_hits)
-
             rect_hits = search_hits if search_hits else stream_hits
             return dedup(rect_hits)
 
-        def _suppress_overlap_hits(hits, iou_th=0.60):
+        def suppress_overlap_hits(hits, iou_th=0.60):
             def area(r): return max(0.0, (r.x1 - r.x0) * (r.y1 - r.y0))
             def inter(r1, r2):
                 x0 = max(r1.x0, r2.x0); y0 = max(r1.y0, r2.y0)
@@ -4351,7 +4550,7 @@ class MainWindow(QMainWindow):
                         label = chr(ord('a') + (v_idx % 26))
                         gid = self.surf2gid.get(s, 0)
                         rects = robust_find_on_page(page, [s])
-                        rects = _suppress_overlap_hits(rects)
+                        rects = suppress_overlap_hits(rects)
                         for r in rects:
                             page_rects.append((r, s, gid, label, kind))
                     for r, text, gid, var, kind in page_rects:
@@ -4366,173 +4565,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "完了", "PDFへマーキングしました。")
         except Exception as e:
             QMessageBox.critical(self, "エラー", str(e))
-
-    def on_text_filter_changed(self, text: str):
-        self.proxy_unified.setTextFilter(text)
-        self.proxy_tokens.setFilterFixedString(text)
-        self._refresh_candidate_count()
-    def on_shortlen_filter_changed(self, *_):
-        """短文（aの文字数）フィルタのUI変更ハンドラ"""
-        self.proxy_unified.setHideShortEnabled(self.chk_shortlen.isChecked())
-        self.proxy_unified.setHideShortLength(self.sb_shortlen.value())
-        self._refresh_candidate_count()
-
-    def on_reason_changed(self, *_):
-        self.proxy_unified.setReasonFilter(self._selected_reasons())
-        self._refresh_candidate_count()
-    def on_scope_changed(self, *_):
-        self.proxy_unified.setScopeFilter(self._selected_scopes())
-        self._refresh_candidate_count()
-    def on_edge_filter_changed(self, *_):
-        """端差（前/後1字）＋ 数字以外一致 のチェックボックス変更ハンドラ"""
-        self.proxy_unified.setHidePrefixEdge(self.chk_edge_prefix.isChecked())
-        self.proxy_unified.setHideSuffixEdge(self.chk_edge_suffix.isChecked())
-        self.proxy_unified.setHideNumericOnly(self.chk_num_only.isChecked())  # ★追加
-        self._refresh_candidate_count()
-    def _selected_reasons(self) -> Set[str]:
-        return {r for r, cb in self.chk_reasons.items() if cb.isChecked()}
-    def _selected_scopes(self) -> Set[str]:
-        return {s for s, cb in self.chk_scopes.items() if cb.isChecked()}
-
-    # 追加：'端差' と '数字以外一致' の列をビュー上だけ非表示
-    def _hide_aux_columns(self) -> None:
-        """QTableView（表記ゆれ候補）から『端差』『数字以外一致』列を非表示にします。"""
-        view = self.view_unified
-        model = view.model()  # Proxy（UnifiedFilterProxy）
-        if not model:
-            return
-        for name in ("端差", "数字以外一致"):
-            for c in range(model.columnCount()):
-                h = model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
-                if isinstance(h, str) and h.strip() == name:
-                    view.setColumnHidden(c, True)
-                    break
-
-
-# ヘッダ名から「ビュー上の列インデックス」を探す
-    def _find_view_column(self, header_name: str) -> int:
-        model = self.view_unified.model()  # Proxy（UnifiedFilterProxy）
-        if not model:
-            return -1
-        for c in range(model.columnCount()):
-            h = model.headerData(c, Qt.Horizontal, Qt.DisplayRole)
-            if isinstance(h, str) and h.strip() == header_name:
-                return c
-        return -1
-
-    # a/b 列の幅を min～max でクリップ（自動調整の“あと”に呼ぶ）
-    def _cap_ab_widths(self, min_a=220, max_a=420, min_b=220, max_b=420):
-        view = self.view_unified
-        hdr  = view.horizontalHeader()
-        idx_a = self._find_view_column("a")
-        idx_b = self._find_view_column("b")
-        for idx, min_w, max_w in ((idx_a, min_a, max_a), (idx_b, min_b, max_b)):
-            if idx >= 0:
-                w = view.columnWidth(idx)
-                w = max(min_w, min(w, max_w))
-                view.setColumnWidth(idx, w)
-                # 以後は自動リサイズではなく“手動ベース”にしておく
-                hdr.setSectionResizeMode(idx, QHeaderView.Interactive)
-
-    def _build_filtered_unified_df(self) -> pd.DataFrame:
-        """現在のフィルタ結果（表示中の行のみ）をDataFrameとして返す。先頭に「選択」列を付与。"""
-        src_df = getattr(self.model_unified, "_df", pd.DataFrame())
-        if src_df.empty:
-            # 「選択」列だけを持つ空表（ヘッダ付きでExcelに出せる）
-            return pd.DataFrame(columns=["選択"] + list(src_df.columns))
-
-        rows_src = []
-        sel_flags = []
-        for r_proxy in range(self.proxy_unified.rowCount()):
-            sidx = self.proxy_unified.mapToSource(self.proxy_unified.index(r_proxy, 0))
-            i = sidx.row()
-            if i < 0 or i >= len(self.model_unified._checks):
-                continue
-            rows_src.append(i)
-            sel_flags.append(bool(self.model_unified._checks[i]))
-
-        if not rows_src:
-            return pd.DataFrame(columns=["選択"] + list(src_df.columns))
-
-        out = src_df.iloc[rows_src].copy().reset_index(drop=True)
-        out.insert(0, "選択", sel_flags)
-
-        # 列の並びを軽く整える（見やすさ重視）
-        cols = list(out.columns)
-        prefer = [c for c in ["選択", "gid", "字数", "a", "b", "一致要因", "対象", "端差", "数字以外一致"] if c in cols]
-        rest = [c for c in cols if c not in prefer]
-        out = out[prefer + rest]
-        return out
-
-    def _current_filter_state(self) -> dict:
-        """GUIのフィルタ状態を辞書で返す（Excelの「フィルタ設定」シート用）。"""
-        return {
-            "全文": self.ed_filter.text() or "",
-            "対象（表示）": "、".join(sorted(self._selected_scopes())),
-            "一致要因（表示）": "、".join(sorted(self._selected_reasons())),
-            "前1文字差を非表示": "ON" if self.chk_edge_prefix.isChecked() else "OFF",
-            "後1文字差を非表示": "ON" if self.chk_edge_suffix.isChecked() else "OFF",
-            "数字以外一致を非表示": "ON" if self.chk_num_only.isChecked() else "OFF",
-            "字数フィルタ 有効": "ON" if self.chk_shortlen.isChecked() else "OFF",
-            "字数フィルタ（n以下を隠す）": self.sb_shortlen.value() if self.chk_shortlen.isChecked() else "",
-            "読み 類似しきい値": self.dsb_read.value(),
-            "文字 類似しきい値": self.dsb_char.value(),
-            "解析ファイル数": len(self.files),
-            "解析ファイル一覧": "\n".join(self.files),
-            "エクスポート日時": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-
-    def _build_unified_df_with_selection_all(self) -> pd.DataFrame:
-        """
-        フィルタ前の全件（model_unified._df 全行）に「選択」列を付けて返す。
-        Excel出力で“データは全件、見た目はフィルタ適用”を実現するための基礎DF。
-        """
-        src_df = getattr(self.model_unified, "_df", pd.DataFrame())
-        if src_df.empty:
-            return pd.DataFrame(columns=["選択"] + list(src_df.columns))
-
-        # 現在のチェック状態を先頭列に
-        checks = list(getattr(self.model_unified, "_checks", []))
-        if len(checks) != len(src_df):
-            # サイズが違う（何かの操作直後等）は全Falseで揃える
-            checks = [False] * len(src_df)
-
-        out = src_df.copy().reset_index(drop=True)
-        out.insert(0, "選択", checks)
-
-        # 補助：'字数' 列が無ければ a の長さから作る（Excelの数値フィルタ用）
-        if "字数" not in out.columns and "a" in out.columns:
-            out["字数"] = out["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
-
-        return out
-
-    def _sanitize_df_for_excel(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Excel出力前の安全化:
-        - dict / list / tuple / set は JSON 文字列化
-        - None/NaN は空文字
-        - それ以外はそのまま（数値は数値のまま）
-        """
-        import json
-        import math
-        def coerce(v):
-            # NaN も空へ
-            if v is None:
-                return ""
-            if isinstance(v, float) and math.isnan(v):
-                return ""
-            # コンテナ系はJSON化（ensure_ascii=Falseで日本語もOK）
-            if isinstance(v, (dict, list, tuple, set)):
-                try:
-                    return json.dumps(v, ensure_ascii=False)
-                except Exception:
-                    return str(v)
-            return v
-
-        for col in df.columns:
-            # object列のみmap（数値列は触らない）
-            if df[col].dtype == "object":
-                df[col] = df[col].map(coerce)
-        return df
 
 def main():
     app = QApplication(sys.argv)
