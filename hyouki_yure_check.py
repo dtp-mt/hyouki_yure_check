@@ -78,6 +78,377 @@ def sim_with_threshold(a: str, b: str, th: float) -> Optional[float]:
     if d is None:
         return None
     return 1.0 - d / L
+
+# ==== 読み類似スコア（数・記号は読み対象外／満点抑制の強化版） ==================
+KANJI_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]")
+
+def _has_kanji(s: str) -> bool:
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    s = nfkc(s)
+    return bool(KANJI_RE.search(s))
+
+def _norm_len_for_surface(s: str) -> int:
+    """表層長（比較用）。NFKC→空白除去。"""
+    if s is None:
+        s = ""
+    s = nfkc(str(s))
+    s = re.sub(r"\s+", "", s)
+    return len(s)
+
+# ===== [Patch] 読み一致（reading_eq）のスコアを 1.0 固定にしない軽量スコアラー =====
+def _numeric_chunk_count(s: str) -> int:
+    """
+    NFKC 後の文字列に _NUMERIC_CHUNK_RE を当てて、数値“まとまり”の個数を数える。
+    例: '630W[30°C]' -> 2（630, 30）
+    """
+    try:
+        nf = unicodedata.normalize("NFKC", "" if s is None else str(s))
+    except Exception:
+        nf = "" if s is None else str(s)
+    return sum(1 for _ in _NUMERIC_CHUNK_RE.finditer(nf))
+
+def reading_eq_score(a: str, b: str) -> float:
+    """
+    'reading_eq' に分類されたペアの “類似度” を 1.0 固定にせず、
+    a/b の差に応じた小さな減点を与えて 0.90〜0.995 の範囲に収める。
+
+    減点規則（初期チューニング）：
+      - P0: a != b                   …… -0.01
+      - P1: 表層長差（NFKC/空白除去）…… -min(0.05, 0.01 * |len_a - len_b|)
+      - P2: 数値チャンク個数差             …… -min(0.02, 0.005 * |numA - numB|)
+      - P3: 片側だけ漢字を含む                …… -0.01
+
+    最終クランプ：0.90 <= score <= 0.995
+    """
+    a_s = "" if a is None else str(a)
+    b_s = "" if b is None else str(b)
+
+    score = 1.0
+
+    # P0: 表層が同一でない（reading_eq は基本 a!=b の想定）
+    if a_s != b_s:
+        score -= 0.01
+
+    # P1: NFKC + 空白除去の長さ差
+    try:
+        la = _norm_len_for_surface(a_s)  # 既存：nfkc -> 空白除去 -> len
+        lb = _norm_len_for_surface(b_s)
+        diff_len = abs(la - lb)
+        if diff_len > 0:
+            score -= min(0.05, 0.01 * diff_len)
+    except Exception:
+        pass
+
+    # P2: 数値“まとまり”個数差
+    try:
+        na = _numeric_chunk_count(a_s)
+        nb = _numeric_chunk_count(b_s)
+        diff_num = abs(na - nb)
+        if diff_num > 0:
+            score -= min(0.02, 0.005 * diff_num)
+    except Exception:
+        pass
+
+    # P3: 片方だけ漢字を含む
+    try:
+        if _has_kanji(a_s) != _has_kanji(b_s):
+            score -= 0.01
+    except Exception:
+        pass
+
+    # 取りすぎない・取りなさすぎない
+    score = max(0.90, min(0.995, score))
+
+    # UI 側の丸めと整合（内部でも丸めておく）
+    return round(float(score), 3)
+# ===== [Patch end] ============================================================
+
+def _surface_core_for_reading(s: str) -> str:
+    """
+    読み対象の“和字コア”を抽出:
+      - NFKC 正規化後、
+      - ひらがな/カタカナ/漢字 だけ残す（他は読み対象外として捨てる）
+      - 空白・数字(Nd)・記号(P/S)・ラテン文字・半記号 等は除去
+    例:
+      "000円"  -> "円"
+      "250円"  -> "円"
+      "Ver1.0円" -> "円"
+      "電気"   -> "電気"（両方とも漢字なので残る）
+    """
+    if s is None:
+        s = ""
+    nf = nfkc(str(s))
+    out = []
+    for ch in nf:
+        code = ord(ch)
+        if (0x3040 <= code <= 0x309F) or (0x30A0 <= code <= 0x30FF) or \
+           (0x3400 <= code <= 0x4DBF) or (0x4E00 <= code <= 0x9FFF) or \
+           (0xF900 <= code <= 0xFAFF):
+            out.append(ch)
+        # それ以外（数字・記号・空白・ラテン等）は読み対象外として捨てる
+    return "".join(out)
+
+# ===== [Patch] ℃専用の「読み一致（満点）」ショートカット =========================
+# 目的：
+#   和字コア（かな/カナ/漢字）が両方空（= 読みが取れない記号・英数・単位のみ）で、
+#   「数字を除いた残り」から 温度記号 '°' と 'C/c' を抽出した結果が双方とも「°C」
+#   になる場合に限り、reading_eq（= 満点 1.0）扱いにする。
+#   ※ 単位一般は扱わず、「℃」ケースに限定。
+#
+# 使いどころ：
+#   build_synonym_pairs_general() / _pairs_chunk_worker() の
+#   「読み一致（英数記号除く）」分岐でこの関数が使われるため、ここを差し替えるだけで
+#   「30℃」↔「630W［30℃」や「20℃」↔「30℃」が 1.0 で reading_eq に入ります。
+
+def _temp_marker_core_after_number_strip(s: str) -> str:
+    """
+    NFKC → 数字まとまり除去（既存の _strip_numbers_like）後、
+    温度記号に関係する最小核だけを取り出す。
+    - '°' と 'C/c' がともに残っていれば '°C' を返す
+    - それ以外は空文字
+    """
+    if s is None:
+        return ""
+    # 既存の数字まとまり除去（NFKC 内部で実施される）
+    t = _strip_numbers_like(s)  # 例: "630W[30°C]" -> "W[°C]"
+    if not t:
+        return ""
+    # 温度記号に関係ない文字は落とし、'°' と 'C/c' だけ残す
+    keep = []
+    for ch in t:
+        if ch == "°" or ch in ("C", "c"):
+            keep.append(ch)
+    has_deg = "°" in keep
+    has_c   = ("C" in keep) or ("c" in keep)
+    return "°C" if has_deg and has_c else ""
+
+def is_symbol_only_surface_diff(a: str, b: str) -> bool:
+    """
+    表層 a, b のうち、ひらがな/カタカナ/漢字だけを取り出した “和字コア” が
+    一致するかどうか（= 記号・英数・単位の差だけか）を判定する。
+
+    変更点（℃専用の救済）：
+      - 和字コアが両方 空 の場合に限り、
+        「数字を除いた後」に温度記号の最小核（° + C/c）が
+        双方で満たされる（= '°C'）なら True を返す。
+      - 単位一般は扱わず、あくまで「℃」相当のケースに限定。
+
+    これにより、以下が True（= reading_eq, score=1.0 対象）になります：
+      - "20℃" ↔ "30℃"
+      - "30℃" ↔ "630W［30℃"
+    反対に、和字コアが非対称（例: "℃" ↔ "たび"）は False のまま。
+    """
+    ca = _surface_core_for_reading(a)
+    cb = _surface_core_for_reading(b)
+
+    # 既存ルール：和字コアが非空で一致 → True
+    if ca and cb:
+        return ca == cb
+
+    # 追加ルール（℃専用）：
+    # 両方とも和字コアが空 かつ 「数字を除いた後」の温度核が双方 '°C'
+    if not ca and not cb:
+        ta = _temp_marker_core_after_number_strip(a)
+        tb = _temp_marker_core_after_number_strip(b)
+        if ta and tb and (ta == tb == "°C"):
+            return True
+
+    return False
+
+def reading_sim_with_penalty(a_surface: str, b_surface: str, ra: str, rb: str, th: float) -> Optional[float]:
+    """
+    読み同士の類似度（帯付きLevenshtein）を返すが、以下の調整を行う：
+
+    [A] “和字コア”が一致する（= 数字・記号・空白など読み対象外だけが違う）場合は
+        読み類似を強制で 1.0（満点）にする。
+        例: 「000円」vs「250円」→ コアはどちらも「円」 ⇒ 1.0
+
+    [B] それ以外で満点(≈1.0)になった場合は、満点抑制を適用：
+        [P0] 表層が異なるだけで 1.0 は避ける       → -0.01
+        [P1] 片方だけ漢字を含む（かな/漢字表記差）→ さらに -0.01（計 -0.02）
+        [P2] 表層長が異なる（読み対象文字数差）   → さらに -0.05
+
+    例：
+      「電気」vs「電機」  → P0: 1.00→0.99
+      「とき」vs「冬季」  → P0+P1: 1.00→0.98
+      「離し」vs「話」    → P0+P2: 1.00→0.94
+    """
+    ra = "" if ra is None else str(ra)
+    rb = "" if rb is None else str(rb)
+
+    # --- [A] 数字・記号・空白などを除いた“和字コア”が一致するなら、読み=1.0 扱い ---
+    core_a = _surface_core_for_reading(a_surface)
+    core_b = _surface_core_for_reading(b_surface)
+    if core_a and core_b and core_a == core_b:
+        # 読み生成（ra/rb）が数字読みなどで異なっても、読み対象はコアのみとみなす
+        return 1.0
+
+    # --- 読みが両方空なら、読み類似は使わない ---
+    if len(ra) == 0 and len(rb) == 0:
+        return None
+
+    sim = sim_with_threshold(ra, rb, th)
+    if sim is None:
+        return None
+
+    # --- [B] 満点(≈1.0)のときだけ抑制ロジックを適用 ---
+    if sim >= 0.9999:
+        penalized = 1.0
+
+        # [P0] 表層差があるなら -0.01
+        if str(a_surface) != str(b_surface):
+            penalized -= 0.01
+
+        # [P1] 片方だけ漢字を含むなら -0.01（合計 -0.02）
+        if _has_kanji(a_surface) != _has_kanji(b_surface):
+            penalized -= 0.01
+
+        # [P2] 表層長（NFKC/空白無視）が異なるなら -0.05
+        if _norm_len_for_surface(a_surface) != _norm_len_for_surface(b_surface):
+            penalized -= 0.05
+
+        sim = penalized
+
+    return sim
+
+# ==== 読み類似のスコア再採点（lemma/活用も“読み”基準で減点 + P4 追加） ============
+READING_LIKE_REASONS = {"lemma", "lemma_read", "inflect", "reading"}
+
+# 追加：読み不一致の追加減点（調整しやすいように定数化）
+READ_MISMATCH_PENALTY = 0.03  # ←「0.99より下げたい」ニュアンスに最適化
+
+def _reading_for_surface_cached(s: str) -> str:
+    """表層 s の“読み（骨格）”。MeCab があればそれ、無ければ簡易フォールバック。"""
+    ok, _ = ensure_mecab()
+    if ok:
+        return phrase_reading_norm_cached(s or "")
+    # フォールバック（NFKC→ひら->カナ→カナ以外除去→長音除去）
+    return normalize_kana(hira_to_kata(nfkc(s or "")), drop_choon=True)
+
+def _lemma_joined_for_surface(s: str) -> str:
+    """
+    表層 s の lemma を連結して返す（活用差の検出に使う）。
+    例: 「あわせ」「合わせる」→ ともに '合わせる'（期待）
+    """
+    ok, _ = ensure_mecab()
+    if not ok or MECAB_TAGGER is None:
+        # MeCab 無しなら NFKC 表層を代用（厳密でなくてOK）
+        return nfkc(s or "")
+    toks = tokenize_mecab(s or "", MECAB_TAGGER)
+    # lemma が無ければ surface を採用
+    return "".join((lemma if (lemma and isinstance(lemma, str)) else surf)
+                   for (surf, pos1, lemma, reading, ct, cf) in toks)
+
+def _surface_core_for_reading(s: str) -> str:
+    """読み対象の“和字コア”（漢字・ひらがな・カタカナのみ）を抽出。"""
+    nf = nfkc(str(s or ""))
+    out = []
+    for ch in nf:
+        o = ord(ch)
+        if (0x3040 <= o <= 0x309F) or (0x30A0 <= o <= 0x30FF) or \
+           (0x3400 <= o <= 0x4DBF) or (0x4E00 <= o <= 0x9FFF) or \
+           (0xF900 <= o <= 0xFAFF):
+            out.append(ch)
+    return "".join(out)
+
+def _script_pattern(s: str) -> str:
+    """
+    文字ごとのスクリプト種別列（K:漢字/H:ひら/C:カナ/O:その他）を返す。
+    スペースは除外。NFKC 後のコードポイントに基づく。
+    """
+    def tag(ch: str) -> str:
+        o = ord(ch)
+        if 0x3400 <= o <= 0x4DBF or 0x4E00 <= o <= 0x9FFF or 0xF900 <= o <= 0xFAFF:
+            return "K"
+        if 0x3040 <= o <= 0x309F:
+            return "H"
+        if 0x30A0 <= o <= 0x30FF:
+            return "C"
+        return "O"
+    nf = nfkc(str(s or ""))
+    return "".join(tag(ch) for ch in nf if not ch.isspace())
+
+def recalibrate_reading_like_scores(df: pd.DataFrame, read_th: float) -> pd.DataFrame:
+    """
+    df（columns: a,b,reason,score, ...）のうち、reason が
+    {lemma, lemma_read, inflect, reading} の行を “読み”の規則で **再採点** して
+    reason を 'reading' に揃える。
+
+    減点規則:
+      P0: 表層差（a!=b）                       → -0.01
+      P1: 片側のみ漢字                          → -0.01
+      P2: 表層長差（NFKC/空白除去）             → -0.05
+      P3: lemma 一致 & 表層差                   → -0.02
+      P4: スクリプト構成が同一かつ 読みが異なる → -0.03  ★今回追加
+
+    ただし、和字コア（漢字/かなのみ）が完全一致するケース（= 数字・記号だけの差）は
+    読み 1.0 を **強制維持**（例: 「000円」↔「250円」→「円」一致）。
+    """
+    if df is None or df.empty:
+        return df
+    need_cols = {"a", "b", "reason", "score"}
+    if not need_cols.issubset(set(df.columns)):
+        return df
+
+    mask = df["reason"].isin(READING_LIKE_REASONS)
+    if not mask.any():
+        return df
+
+    df = df.copy()
+
+    # スキャン対象の表層を一括で前計算（キャッシュ）
+    surfaces = set(df.loc[mask, "a"].astype(str)) | set(df.loc[mask, "b"].astype(str))
+    surf2read   = {s: _reading_for_surface_cached(s) for s in surfaces}
+    surf2lemma  = {s: _lemma_joined_for_surface(s)   for s in surfaces}
+    surf2core   = {s: _surface_core_for_reading(s)   for s in surfaces}
+    surf2script = {s: _script_pattern(s)             for s in surfaces}
+
+    def _has_kanji(s: str) -> bool:
+        return bool(re.search(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]", nfkc(s or "")))
+
+    def _len_norm(s: str) -> int:
+        return len(re.sub(r"\s+", "", nfkc(s or "")))
+
+    def _calc(row):
+        a = str(row["a"]); b = str(row["b"])
+
+        # 1) “和字コア”一致（数字・記号差のみ）→ 読み 1.0 維持
+        if surf2core.get(a, "") and surf2core.get(b, "") and (surf2core[a] == surf2core[b]):
+            return 1.0
+
+        ra = surf2read.get(a, ""); rb = surf2read.get(b, "")
+        pattern_equal = (surf2script.get(a, "") == surf2script.get(b, ""))
+        read_mismatch = (bool(ra) and bool(rb) and ra != rb)
+
+        # 2) 読みが閾値以上で算出できた場合（内側で満点抑制済み）
+        sim = reading_sim_with_penalty(a, b, ra, rb, read_th)
+        if sim is not None:
+            val = float(sim)
+            # lemma一致 & 表層差 → P3
+            if val >= 0.9999 and a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")):
+                val -= 0.02
+            # スクリプト構成が同じ かつ 読みが異なる → P4
+            if pattern_equal and read_mismatch:
+                val -= READ_MISMATCH_PENALTY
+            return max(val, 0.0)
+
+        # 3) 読みが取れなかった場合でも、満点のままにしない：ペナルティ合算
+        penal = 1.0
+        if a != b: penal -= 0.01                           # P0
+        if _has_kanji(a) != _has_kanji(b): penal -= 0.01   # P1
+        if _len_norm(a) != _len_norm(b): penal -= 0.05     # P2
+        if a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")):
+            penal -= 0.02                                  # P3
+        if pattern_equal and read_mismatch:
+            penal -= READ_MISMATCH_PENALTY                # P4
+        return max(penal, 0.0)
+
+    df.loc[mask, "score"]  = df.loc[mask].apply(_calc, axis=1)
+    df.loc[mask, "reason"] = "reading"
+    return df
+# =============================================================================
+
 def _ngram_set(s: str, n: int = 2):
     return {s[i:i+n] for i in range(len(s)-n+1)} if len(s) >= n else {s}
 
@@ -102,6 +473,81 @@ try:
 except Exception:
     HAS_MECAB = False
     MECAB_TAGGER = None
+
+# === 最終スコアを combined_char_similarity で強制（score_reasonは作らない既定） ===
+def enforce_combined_similarity_score(
+    df: pd.DataFrame,
+    keep_backup: bool = False,   # 既定で退避しない
+    drop_existing_backup: bool = True,  # 既にある 'score_reason' は落とす
+) -> pd.DataFrame:
+    """
+    最終表示用に score を combined_char_similarity に差し替える。
+    keep_backup=True のときだけ元スコアを score_reason に退避（.3f）。
+    drop_existing_backup=True のとき、既にある score_reason を削除。
+    """
+    if df is None or df.empty:
+        return df
+    if not {"a", "b"}.issubset(df.columns):
+        return df
+
+    df = df.copy()
+
+    # バックアップ列の扱い
+    if drop_existing_backup:
+        df.drop(columns=["sore_reason", "score_reason"], errors="ignore", inplace=True)
+    if keep_backup and "score" in df.columns and "score_reason" not in df.columns:
+        df["score_reason"] = pd.to_numeric(df["score"], errors="coerce").round(3)
+
+    # 表層キャッシュ（NFKC と 2-gram）
+    try:
+        uniq = pd.unique(pd.concat([df["a"], df["b"]]).astype("string"))
+    except Exception:
+        uniq = pd.unique(pd.concat([df["a"].astype(str), df["b"].astype(str)]))
+
+    nf = {}
+    grams = {}
+    for s in uniq:
+        s = "" if pd.isna(s) else str(s)
+        ns = nfkc(s)
+        nf[s] = ns
+        grams[s] = frozenset(_ngram_set(ns, 2))
+
+    def _calc(row):
+        a = "" if pd.isna(row["a"]) else str(row["a"])
+        b = "" if pd.isna(row["b"]) else str(row["b"])
+        try:
+            val = combined_char_similarity(
+                a, b,
+                sa=nf.get(a), sb=nf.get(b),
+                grams_a=grams.get(a), grams_b=grams.get(b),
+            )
+        except Exception:
+            # フォールバック：最悪でも 0.0〜1.0
+            try:
+                val = max(0.0, min(1.0, float(levenshtein_sim(nfkc(a), nfkc(b)))))
+            except Exception:
+                val = 0.0
+        return round(float(val), 3)
+
+    df["score"] = df.apply(_calc, axis=1)
+    return df
+# =====================================================================
+
+# === 読み一致( reading_eq )で最終スコア1.0のものを 'basic' に付け替え ==========
+def reclassify_basic_for_reading_eq(df: pd.DataFrame, eps: float = 0.0005) -> pd.DataFrame:
+    """
+    df に対し、reason=='reading_eq' かつ score が 1.0（丸め誤差±eps）を 'basic' へ変更。
+    """
+    if df is None or df.empty or "reason" not in df.columns or "score" not in df.columns:
+        return df
+    df = df.copy()
+    # 丸め誤差込みで 1.0 判定（例: 0.9996 以上は 1.000 とみなす）
+    m = (df["reason"] == "reading_eq") & (pd.to_numeric(df["score"], errors="coerce").fillna(0.0) >= 1.0 - eps)
+    if m.any():
+        df.loc[m, "reason"] = "basic"
+        df.loc[m, "score"] = 1.0  # 表示上も 1.0 にそろえる
+    return df
+# =============================================================================
 
 # ------------------------------------------------------------
 # 共通ユーティリティ
@@ -157,16 +603,528 @@ class PageData:
     page: int
     text_join: str
 
-def extract_pages(pdf_path: str) -> List[PageData]:
-    pages = []
+# ====== ここから差し替え（堅めのフォールバック入り） ======
+def _compose_text_from_rawdict(
+    page,
+    *,
+    vertical_strategy: str = "auto",   # "auto" | "force_v" | "force_h"
+    drop_marginal: bool = False,
+    margin_ratio: float = 0.045,
+
+    # カラム検出
+    col_bin_ratio_h: float = 0.08,     # 横: ビン幅（ページ幅比）
+    col_bin_ratio_v: float = 0.06,     # 縦: ビン幅（ページ幅比; やや細かめ）
+
+    # ギャップ閾値
+    span_space_ratio_h: float = 0.006, # 横: スペース
+    cell_tab_ratio_h: float   = 0.018, # 横: タブ
+    char_space_ratio_v: float = 0.004, # 縦: charベース スペース
+    char_tab_ratio_v: float   = 0.012, # 縦: charベース タブ
+
+    # ルビ抑制
+    drop_ruby: bool = True,
+    ruby_size_ratio: float = 0.60,     # 行の中央値サイズ × 0.60 未満をルビ候補
+):
+    """
+    縦組み強化版のブロック整形:
+      - 行ごとに縦横判定（wmode / dir / char分布のIQR比）
+      - 縦行は char 単位で連結（スペース/タブ判定は Δy）
+      - 縦カラムは x中心でクラスタ → 右→左に結合
+      - 横は従来の spanベース（Δx）で連結
+    """
+    rd = page.get_text("rawdict")
+    blocks = rd.get("blocks", []) if isinstance(rd, dict) else []
+    if not blocks:
+        return ""
+
+    width  = float(page.rect.width)
+    height = float(page.rect.height)
+
+    # 絶対値へ
+    span_space_h = max(1.5, width  * span_space_ratio_h)
+    cell_tab_h   = max(3.0, width  * cell_tab_ratio_h)
+    char_space_v = max(1.0, height * char_space_ratio_v)
+    char_tab_v   = max(2.0, height * char_tab_ratio_v)
+
+    col_bin_w_h = max(16.0, width * col_bin_ratio_h)
+    col_bin_w_v = max(12.0, width * col_bin_ratio_v)
+
+    top_margin = height * margin_ratio
+    bot_margin = height * (1.0 - margin_ratio)
+
+    from collections import defaultdict
+    import statistics as stats
+
+    def _span_text(sp) -> str:
+        t = sp.get("text") or ""
+        if t.strip():
+            return t
+        chs = sp.get("chars")
+        if isinstance(chs, list) and chs:
+            return "".join(ch.get("c", "") for ch in chs)
+        return ""
+
+    def _line_chars(ln):
+        """行内の char 配列を平坦化して返す。各要素: (c, x0,y0,x1,y1, size)"""
+        out = []
+        for sp in ln.get("spans", []):
+            size = float(sp.get("size", 0.0) or 0.0)
+            chs = sp.get("chars")
+            if isinstance(chs, list) and chs:
+                for ch in chs:
+                    c = ch.get("c", "")
+                    x0,y0,x1,y1 = map(float, ch.get("bbox", (0,0,0,0)))
+                    out.append((c,x0,y0,x1,y1,size))
+            else:
+                # charsが無い場合はspan.textを1文字ずつ（近似）
+                t = sp.get("text") or ""
+                if not t:
+                    continue
+                x0,y0,x1,y1 = map(float, sp.get("bbox", (0,0,0,0)))
+                # 幅/文字数で荒く分割（均等割り）
+                n = max(1, len(t))
+                w = (x1 - x0) / n if n else 0
+                for i, c in enumerate(t):
+                    cx0 = x0 + i*w
+                    cx1 = cx0 + w
+                    out.append((c, cx0, y0, cx1, y1, size))
+        return out
+
+    def _is_vertical_line(ln) -> bool:
+        # 1) wmode / dir を優先
+        wmode = ln.get("wmode")
+        if isinstance(wmode, int) and wmode == 1:
+            return True
+        dirv = ln.get("dir")
+        if isinstance(dirv, (list, tuple)) and len(dirv) >= 2:
+            try:
+                dx, dy = float(dirv[0]), float(dirv[1])
+                if abs(dy) > abs(dx):
+                    return True
+            except Exception:
+                pass
+
+        # 2) char 分布で判定（IQR 比でロバスト）
+        chars = _line_chars(ln)
+        if len(chars) < 2:
+            return False  # 情報不足→横扱い
+        xs = [(x0+x1)/2 for _,x0,y0,x1,y1,_ in chars]
+        ys = [(y0+y1)/2 for _,x0,y0,x1,y1,_ in chars]
+        try:
+            iqr_x = stats.quantiles(xs, n=4)[2] - stats.quantiles(xs, n=4)[0]
+            iqr_y = stats.quantiles(ys, n=4)[2] - stats.quantiles(ys, n=4)[0]
+        except Exception:
+            # フォールバック：分散比
+            import math
+            mean_x = sum(xs)/len(xs); mean_y = sum(ys)/len(ys)
+            iqr_x = sum((x-mean_x)**2 for x in xs)/len(xs)
+            iqr_y = sum((y-mean_y)**2 for y in ys)/len(ys)
+        # y広がりが明確に大きければ縦
+        return (iqr_y > iqr_x * 1.6)
+
+    def _build_line_text_vertical(ln) -> str:
+        """縦行を char 単位で復元（ルビ抑制・Δyでスペ/タブ判定）"""
+        chars = _line_chars(ln)
+        if not chars:
+            return ""
+        # ルビ抑制のため、行のフォントサイズ中央値
+        if drop_ruby:
+            sizes = [sz for *_, sz in chars if sz > 0]
+            med = stats.median(sizes) if sizes else 0.0
+        # 読みは上→下
+        chars.sort(key=lambda t: t[2])  # y0
+
+        parts = []
+        prev_y1 = None
+        for c, x0, y0, x1, y1, sz in chars:
+            if drop_ruby and med and sz and sz < med * ruby_size_ratio:
+                # ルビはスキップ
+                continue
+            if prev_y1 is None:
+                parts.append(c)
+            else:
+                gap = y0 - prev_y1
+                if gap >= char_tab_v:
+                    parts.append("\t"); parts.append(c)
+                elif gap >= char_space_v:
+                    parts.append(" ");  parts.append(c)
+                else:
+                    parts.append(c)
+            prev_y1 = y1
+        return "".join(parts).strip()
+
+    def _build_line_text_horizontal(ln, span_space=span_space_h, cell_tab=cell_tab_h) -> str:
+        spans = ln.get("spans", [])
+        if not spans:
+            return ""
+        # xで並べ替え
+        spans = sorted(spans, key=lambda sp: float(sp.get("bbox", [0,0,0,0])[0]))
+        parts = []
+        prev_x1 = None
+        for sp in spans:
+            txt = (_span_text(sp) or "").replace("\u00A0", " ").strip()
+            if not txt:
+                continue
+            x0, y0, x1, y1 = map(float, sp.get("bbox", (0,0,0,0)))
+            if prev_x1 is None:
+                parts.append(txt)
+            else:
+                gap = x0 - prev_x1
+                if gap >= cell_tab:
+                    parts.append("\t"); parts.append(txt)
+                elif gap >= span_space:
+                    parts.append(" ");  parts.append(txt)
+                else:
+                    parts.append(txt)
+            prev_x1 = x1
+        return "".join(parts).strip()
+
+    # ---- ブロック収集＆行ごとに縦横付与 ----
+    blist = []
+    for b in blocks:
+        if b.get("type", 1) != 0:
+            continue
+        x0,y0,x1,y1 = map(float, b.get("bbox", (0,0,0,0)))
+        if drop_marginal and (y1 <= top_margin or y0 >= bot_margin):
+            continue
+        lines = b.get("lines", [])
+        if not lines:
+            continue
+
+        # 行ごとの縦横
+        ln_items = []
+        v_cnt = 0; h_cnt = 0
+        for ln in lines:
+            is_v = _is_vertical_line(ln)
+            ln_items.append((ln, is_v))
+            if is_v: v_cnt += 1
+            else:    h_cnt += 1
+
+        orient = "v" if v_cnt > h_cnt else "h"
+        blist.append({
+            "bbox": (x0,y0,x1,y1),
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "lines_oriented": ln_items,
+            "orient": orient
+        })
+
+    if not blist:
+        return ""
+
+    # ページ優勢方向
+    v_total = sum(1 for tb in blist if tb["orient"] == "v")
+    h_total = len(blist) - v_total
+    if vertical_strategy == "force_v":
+        page_mode = "v"
+    elif vertical_strategy == "force_h":
+        page_mode = "h"
+    else:
+        page_mode = "v" if v_total > h_total else "h"
+
+    # カラムバスケット
+    cols_h = defaultdict(list)
+    cols_v = defaultdict(list)
+
+    for tb in blist:
+        if tb["orient"] == "v":
+            # 縦：x中心でビン
+            cx = (tb["x0"] + tb["x1"]) / 2
+            key = int(cx // col_bin_w_v)
+            cols_v[key].append(tb)
+        else:
+            key = int(tb["x0"] // col_bin_w_h)
+            cols_h[key].append(tb)
+
+    def _build_block_text(tb, vertical_block: bool) -> str:
+        texts = []
+        for ln, is_v in tb["lines_oriented"]:
+            if vertical_block or is_v:
+                t = _build_line_text_vertical(ln)
+            else:
+                t = _build_line_text_horizontal(ln)
+            if t:
+                texts.append(t)
+        return "\n".join(texts)
+
+    # 横: 左→右
+    parts_h = []
+    for ck in sorted(cols_h.keys()):
+        col_blocks = sorted(cols_h[ck], key=lambda b: (b["y0"], b["x0"]))
+        col_texts = []
+        for b in col_blocks:
+            t = _build_block_text(b, vertical_block=False)
+            if t:
+                col_texts.append(t)
+        if col_texts:
+            parts_h.append("\n".join(col_texts))
+
+    # 縦: 右→左（ck降順）
+    parts_v = []
+    for ck in sorted(cols_v.keys(), reverse=True):
+        col_blocks = sorted(cols_v[ck], key=lambda b: (b["y0"], b["x0"]))
+        col_texts = []
+        for b in col_blocks:
+            t = _build_block_text_vertical_charcloud(
+                b,
+                char_space_v=char_space_v,
+                char_tab_v=char_tab_v,
+                drop_ruby=True,
+                ruby_size_ratio=0.60
+            )
+            if t:
+                col_texts.append(t)
+        if col_texts:
+            parts_v.append("\n".join(col_texts))
+
+
+    if page_mode == "v":
+        chunks = []
+        if parts_v: chunks.append("\n".join(parts_v))
+        if parts_h: chunks.append("\n".join(parts_h))
+        return "\n\n".join([c for c in chunks if c])
+    else:
+        chunks = []
+        if parts_h: chunks.append("\n".join(parts_h))
+        if parts_v: chunks.append("\n".join(parts_v))
+        return "\n\n".join([c for c in chunks if c])
+
+def _build_block_text_vertical_charcloud(tb,
+                                         *,
+                                         char_space_v: float,
+                                         char_tab_v: float,
+                                         drop_ruby: bool = True,
+                                         ruby_size_ratio: float = 0.60) -> str:
+    """
+    縦ブロックを、行を信用せずブロック内の全Charから再構成。
+    - X中心でカラム化（右→左の順）
+    - 各カラムは Y 昇順で連結、ΔYでスペース/タブを挿入
+    """
+    lines_oriented = tb.get("lines_oriented") or []
+    # ---- 1) 全Char収集 ----
+    chars = []
+    for ln, _is_v in lines_oriented:
+        for sp in ln.get("spans", []):
+            size = float(sp.get("size", 0.0) or 0.0)
+            chs = sp.get("chars")
+            if isinstance(chs, list) and chs:
+                for ch in chs:
+                    c  = ch.get("c", "")
+                    x0,y0,x1,y1 = map(float, ch.get("bbox", (0,0,0,0)))
+                    cx = (x0 + x1) / 2.0
+                    cy = (y0 + y1) / 2.0
+                    chars.append((c, cx, cy, y0, y1, size))
+            else:
+                # charsが無い場合のフォールバック: span.text を均等割り（精度は低下）
+                t = (sp.get("text") or "")
+                if not t:
+                    continue
+                x0,y0,x1,y1 = map(float, sp.get("bbox", (0,0,0,0)))
+                n = max(1, len(t))
+                w = (x1 - x0) / n if n else 0
+                for i, c in enumerate(t):
+                    cx = x0 + (i + 0.5) * w
+                    cy = (y0 + y1) / 2.0
+                    chars.append((c, cx, cy, y0, y1, size))
+
+    if not chars:
+        return ""
+
+    # ルビ抑制（サイズ中央値の比で判定）
+    if drop_ruby:
+        import statistics as stats
+        sizes = [sz for *_, sz in chars if sz > 0]
+        med = stats.median(sizes) if sizes else 0.0
+        if med > 0:
+            chars = [t for t in chars if not (t[-1] and t[-1] < med * ruby_size_ratio)]
+        if not chars:
+            return ""
+
+    # ---- 2) カラム化（X 量子化 → 右→左）----
+    # カラムのビン幅はブロック幅の数%程度にしておくと安定
+    x0, y0, x1, y1 = tb["x0"], tb["y0"], tb["x1"], tb["y1"]
+    bw = max(1.0, (x1 - x0))
+    col_bin_w = max(8.0, bw * 0.06)   # 必要なら外から渡してもOK
+
+    from collections import defaultdict
+    cols = defaultdict(list)
+    for c, cx, cy, ly0, ly1, sz in chars:
+        key = int((cx - x0) // col_bin_w)
+        cols[key].append((c, cx, cy, ly0, ly1, sz))
+
+    # 右→左（キー降順）で処理
+    texts = []
+    for k in sorted(cols.keys(), reverse=True):
+        col = cols[k]
+        # カラム内は上→下（cy昇順）
+        col.sort(key=lambda t: t[2])
+        parts = []
+        prev_y1 = None
+        for (c, cx, cy, ly0, ly1, sz) in col:
+            if prev_y1 is None:
+                parts.append(c)
+            else:
+                gap = ly0 - prev_y1
+                if gap >= char_tab_v:
+                    parts.append("\t"); parts.append(c)
+                elif gap >= char_space_v:
+                    parts.append(" ");  parts.append(c)
+                else:
+                    parts.append(c)
+            prev_y1 = ly1
+        t = "".join(parts).strip()
+        if t:
+            texts.append(t)
+
+    # カラム間は空行で分離
+    return "\n\n".join(texts)
+
+def extract_pages(pdf_path: str, *,
+                  flatten_for_nlp: bool = False) -> List[PageData]:
+    """
+    1) rawdict 座標ベースで復元
+    2) 空なら 'blocks' でフォールバック
+    3) それでも空なら 'text' で最後のフォールバック
+    """
+    pages: List[PageData] = []
     doc = fitz.open(pdf_path)
     try:
         for i in range(len(doc)):
-            text = doc[i].get_text("text")
-            pages.append(PageData(os.path.basename(pdf_path), i + 1, soft_join_lines_lang_aware(text)))
+            page = doc[i]
+
+            # ① rawdict
+            text_blocked = _compose_text_from_rawdict(
+                page,
+                vertical_strategy="auto",   # ← 縦横自動
+                drop_marginal=False,        # 必要に応じて True に
+                margin_ratio=0.05
+            )
+
+            # ② blocks フォールバック
+            if not text_blocked.strip():
+                try:
+                    blks = page.get_text("blocks")
+                except Exception:
+                    blks = []
+                if blks:
+                    # (x0,y0,x1,y1, text, block_no, block_type) 形式を想定
+                    blks_sorted = sorted(blks, key=lambda t: (t[0], t[1]))
+                    parts = []
+                    for b in blks_sorted:
+                        if len(b) >= 5:
+                            txt = (b[4] or "").rstrip()
+                            if txt:
+                                parts.append(txt)
+                    text_blocked = "\n".join(parts)
+
+            # ③ text 最終フォールバック
+            if not text_blocked.strip():
+                text_blocked = page.get_text("text") or ""
+
+            # NLP用に改行を潰したい場合は既存関数で
+            text_final = soft_join_lines_lang_aware(text_blocked) if flatten_for_nlp else text_blocked
+
+            pages.append(PageData(os.path.basename(pdf_path), i + 1, text_final))
     finally:
         doc.close()
     return pages
+
+# ====== ここまで差し替え ======
+
+# ===== 追加: レイアウト由来の“強制区切り”でセグメント化 =====
+_HARD_BREAK_RE = re.compile(r"[\t\r\n]+")
+
+def iter_nlp_segments(text: str):
+    """
+    レイアウト由来の区切り（改行・タブ）でテキストを分割し、
+    空セグメントを除いて順に返す。
+    """
+    if not isinstance(text, str) or not text:
+        return
+    for seg in _HARD_BREAK_RE.split(text):
+        seg = seg.strip()
+        if seg:
+            yield seg
+
+# ===== GiNZA: 軽量モデル + 文節専用で初期化（差し替え） =====
+HAS_GINZA = False
+GINZA_NLP = None
+
+# 文節抽出に必要な最小構成（parser + bunsetu_recognizer）
+GINZA_ENABLED_COMPONENTS = ("parser", "bunsetu_recognizer")
+
+try:
+    import spacy, ginza
+    # ▼ モデル選択：環境変数 GINZA_MODEL で上書き可（既定は軽量の ja_ginza）
+    #   - ja_ginza: CPU向けの標準モデル（軽量）[1](https://pypi.org/project/ja-ginza/)
+    #   - ja_ginza_electra: Transformerベースで重い（必要時のみ）[2](https://pypi.org/project/ja-ginza-electra/)[3](https://huggingface.co/megagonlabs/transformers-ud-japanese-electra-base-ginza)
+    model_name = os.environ.get("GINZA_MODEL", "ja_ginza").strip()
+
+    # ▼ 不要コンポーネントをロード時に無効化（文節には不要）
+    #   - ner, attribute_ruler, compound_splitter をデフォルトで停止
+    #     （parser と bunsetu_recognizer は動かす）[1](https://pypi.org/project/ja-ginza/)
+    disable = os.environ.get(
+        "GINZA_DISABLE", "ner,attribute_ruler,compound_splitter"
+    ).split(",")
+    disable = [d.strip() for d in disable if d.strip()]
+
+    GINZA_NLP = spacy.load(model_name, disable=disable)
+
+    # （任意）Sudachi の分割モードをCに固定：複合語優先
+    try:
+        ginza.set_split_mode(GINZA_NLP, "C")
+    except Exception:
+        pass
+
+    HAS_GINZA = True
+except Exception:
+    HAS_GINZA = False
+    GINZA_NLP = None
+# ===== GiNZA 初期化ここまで =====
+
+# ===== 差し替え：GiNZA 文節抽出（並列 nlp.pipe + 文節専用） =====
+def ginza_bunsetsu_chunks(text: str) -> list[str]:
+    """
+    GiNZA を '文節だけ' に限定して高速に抽出する:
+      - nlp.select_pipes(enable=['parser','bunsetu_recognizer']) で実行時も絞る
+      - nlp.pipe(..., n_process, batch_size) で並列＆バッチ処理
+      - 改行/タブは空白1つに正規化、長さ 1..120 のみ返す（従来仕様を踏襲）
+    環境変数:
+      GINZA_N_PROCESS : 並列プロセス数（既定 1）
+      GINZA_BATCH_SIZE: バッチサイズ    （既定 64）
+    """
+    ok = HAS_GINZA and (GINZA_NLP is not None)
+    if not ok or not isinstance(text, str) or not text:
+        return []
+
+    # レイアウト由来のセグメントに分けてからまとめて処理
+    segs = [seg for seg in iter_nlp_segments(text)]
+    if not segs:
+        return []
+
+    # 並列・バッチの設定（必要に応じて環境変数で調整）
+    try:
+        n_process = max(1, int(os.environ.get("GINZA_N_PROCESS", "1")))
+    except Exception:
+        n_process = 1
+    try:
+        batch_size = max(1, int(os.environ.get("GINZA_BATCH_SIZE", "64")))
+    except Exception:
+        batch_size = 64
+
+    chunks: list[str] = []
+    # 実行時も 'parser' と 'bunsetu_recognizer' のみに限定して回す（高速化）[4](https://spacy.io/usage/processing-pipelines/)
+    pipes_to_enable = [p for p in GINZA_ENABLED_COMPONENTS if p in GINZA_NLP.pipe_names]
+    with GINZA_NLP.select_pipes(enable=pipes_to_enable):
+        # nlp.pipe による高速ストリーミング処理（並列/バッチ）[4](https://spacy.io/usage/processing-pipelines/)[6](https://spacy.io/api/language/)
+        for doc in GINZA_NLP.pipe(segs, n_process=n_process, batch_size=batch_size):
+            # 文単位に分け、各文の文節Spanを取得（GiNZAの文節API）[5](https://github.com/megagonlabs/ginza/blob/develop/docs/bunsetu_api.md)
+            for sent in doc.sents:
+                for sp in ginza.bunsetu_spans(sent):
+                    s = re.sub(r"[\t\r\n]+", " ", sp.text).strip()
+                    if 1 <= len(s) <= 120:
+                        chunks.append(s)
+    return chunks
+# ===== 差し替えここまで =====
 
 # ------------------------------------------------------------
 # MeCab helpers
@@ -275,50 +1233,60 @@ def extract_candidates_regex(pages: List[PageData], min_len=1, max_len=120, min_
 # ------------------------------------------------------------
 # Compound（連結記号でのみ結合）
 # ------------------------------------------------------------
+
+# ===== （任意）置き換え: 複合語もセグメント単位で =====
 def mecab_compound_tokens_alljoin(text: str) -> List[str]:
     ok, msg = ensure_mecab()
     if not ok:
         raise RuntimeError(msg)
-    toks = tokenize_mecab(text, MECAB_TAGGER)
+    if not isinstance(text, str) or not text:
+        return []
+
     out: List[str] = []
-    parts: List[str] = []
-    has_conn = False
-    prev_type: Optional[str] = None
 
-    def flush():
-        nonlocal parts, has_conn, prev_type
-        if parts and has_conn:
-            token = "".join(parts)
-            if 1 <= len(token) <= 120:
-                out.append(token)
-        parts = []
+    def worker(seg: str):
+        toks = tokenize_mecab(seg, MECAB_TAGGER)
+        parts: List[str] = []
         has_conn = False
-        prev_type = None
+        prev_type: Optional[str] = None
 
-    for surf, pos1, lemma, reading, ct, cf in toks:
-        is_word = pos1.startswith(("名詞", "動詞", "形容詞", "助動詞"))
-        is_conn = surf and all(ch in CONNECT_CHARS for ch in surf)
-        if is_conn:
-            if parts and prev_type == 'word':
-                parts.append(surf)
-                has_conn = True
-                prev_type = 'conn'
+        def flush_local():
+            nonlocal parts, has_conn, prev_type
+            if parts and has_conn:
+                token = "".join(parts)
+                if 1 <= len(token) <= 120:
+                    out.append(token)
+            parts = []
+            has_conn = False
+            prev_type = None
+
+        for surf, pos1, lemma, reading, ct, cf in toks:
+            if not surf:
                 continue
-        elif is_word:
-            if not parts:
-                parts = [surf]
-                prev_type = 'word'
-            else:
-                if prev_type == 'conn':
-                    parts.append(surf)
-                    prev_type = 'word'
+            is_word = pos1.startswith(("名詞", "動詞", "形容詞", "助動詞"))
+            is_conn = surf and all(ch in CONNECT_CHARS for ch in surf)
+
+            if is_conn:
+                if parts and prev_type == 'word':
+                    parts.append(surf); has_conn = True; prev_type = 'conn'
+                continue
+            elif is_word:
+                if not parts:
+                    parts = [surf]; prev_type = 'word'
                 else:
-                    flush()
-                    parts = [surf]
-                    prev_type = 'word'
-        else:
-            flush()
-    flush()
+                    if prev_type == 'conn':
+                        parts.append(surf); prev_type = 'word'
+                    else:
+                        flush_local()
+                        parts = [surf]; prev_type = 'word'
+            else:
+                flush_local()
+
+        flush_local()
+
+    for seg in iter_nlp_segments(text):
+        worker(seg)
+
     return out
 
 def extract_candidates_compound_alljoin(
@@ -343,42 +1311,58 @@ def extract_candidates_compound_alljoin(
 # 文節抽出（簡易ルール）
 # ------------------------------------------------------------
 PUNCT_SET = set('。、．，!.！？？」』〕）】]〉》"\\\'\')')
+
+# ===== 置き換え: MeCab 文節（セグメント単位 + 改行/タブの空白化） =====
 def mecab_bunsetsu_chunks(text: str) -> List[str]:
     ok, msg = ensure_mecab()
     if not ok:
         raise RuntimeError(msg)
-    toks = tokenize_mecab(text, MECAB_TAGGER)
+    if not isinstance(text, str) or not text:
+        return []
+
     chunks: List[str] = []
-    cur: List[str] = []
 
-    def flush():
-        nonlocal cur
-        if cur:
-            s = "".join(cur).strip()
-            if 1 <= len(s) <= 120:
-                chunks.append(s)
-        cur = []
+    def flush(cur: List[str]):
+        if not cur:
+            return
+        s = "".join(cur)
+        # 改行・タブは空白に、連続空白は 1 個に
+        s = re.sub(r"[\t\r\n]+", " ", s)
+        s = re.sub(r"[ ]{2,}", " ", s).strip()
+        if 1 <= len(s) <= 120:
+            chunks.append(s)
+        cur.clear()
 
-    for surf, pos1, lemma, reading, ct, cf in toks:
-        if surf in PUNCT_SET or pos1.startswith("記号"):
-            flush()
-            continue
-        cur.append(surf)
-        if pos1 in ("助詞", "助動詞"):
-            flush()
-    flush()
+    # ★ 重要：セグメント単位に MeCab を回す
+    for seg in iter_nlp_segments(text):
+        toks = tokenize_mecab(seg, MECAB_TAGGER)
+        cur: List[str] = []
+        for surf, pos1, lemma, reading, ct, cf in toks:
+            if not surf:
+                continue
+            # 句読点などの記号で文節を打ち切り
+            if surf in PUNCT_SET or pos1.startswith("記号"):
+                flush(cur)
+                continue
+
+            cur.append(surf)
+            # 助詞・助動詞の直後で文節を区切る（元のロジック）
+            if pos1 in ("助詞", "助動詞"):
+                flush(cur)
+
+        flush(cur)  # セグメント終端で flush
     return chunks
 
 def extract_candidates_bunsetsu(
     pages: List[PageData], min_len=1, max_len=120, min_count=1, top_k=0
-) -> List[Tuple[str, int]]:
+) -> List[Tuple[str,int]]:
     cnt = Counter()
+    # GiNZA があれば最優先、なければ従来の簡易ルール
     for p in pages:
-        for ch in mecab_bunsetsu_chunks(p.text_join):
-            ch = strip_leading_control_chars(ch)  # ★追加
-            if not ch:
-                continue
-            if min_len <= len(ch) <= max_len:
+        chunks = ginza_bunsetsu_chunks(p.text_join) if HAS_GINZA else mecab_bunsetsu_chunks(p.text_join)
+        for ch in chunks:
+            ch = strip_leading_control_chars(ch)
+            if ch and (min_len <= len(ch) <= max_len):
                 cnt[ch] += 1
     arr = [(w, c) for w, c in cnt.items() if c >= min_count]
     arr.sort(key=lambda x: (-x[1], x[0]))
@@ -408,6 +1392,105 @@ def levenshtein_sim(a: str, b: str) -> float:
             cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
         prev = cur
     return 1.0 - prev[lb] / max(la, lb)
+
+# === 合成 2-gram Jaccard × Levenshtein 類似 + 軽ペナルティ ===================
+# 重み（お好みで微調整）
+CHAR_SIM_W_LEV  = 0.60   # Levenshtein 類似の寄与
+CHAR_SIM_W_JACC = 0.40   # 2-gram Jaccard の寄与
+
+# ペナルティ係数（“軽め”）
+P_LEN_PER_CHAR  = 0.01   # 表層長差 1 文字あたりの減点
+P_LEN_CAP       = 0.05   # 表層長差ペナルティの上限
+P_NUM_PER_CHUNK = 0.01   # 数値“まとまり”個数差 1 つあたりの減点
+P_NUM_CAP       = 0.03   # 数値まとまりペナルティの上限
+P_CORE_ASYM     = 0.02   # 片側だけ和字コア（かな/カナ/漢字）が存在する時の一括減点
+
+def _jaccard_2gram(sa: str, sb: str, A=None, B=None) -> float:
+    """
+    2-gram Jaccard（かぶり具合）。A/B に事前計算済みの集合を渡せます。
+    """
+    sa = nfkc(sa or "")
+    sb = nfkc(sb or "")
+    A = _ngram_set(sa, 2) if A is None else set(A)
+    B = _ngram_set(sb, 2) if B is None else set(B)
+    inter = len(A & B)
+    union = len(A | B)
+    return 0.0 if union == 0 else inter / union
+
+def _lev_sim(sa: str, sb: str) -> float:
+    """
+    正規化 Levenshtein 類似（1 - dist/maxlen）。既存の levenshtein_sim を利用。
+    """
+    return levenshtein_sim(nfkc(sa or ""), nfkc(sb or ""))
+
+def _char_penalty(a: str, b: str) -> float:
+    """
+    軽い機械的ペナルティの合算：
+      - 表層長差（NFKC + 空白除去後の len 差）
+      - 数値“まとまり”個数差（例: '630W[30°C]' -> 2）
+      - 片側だけ和字コア（かな/カナ/漢字）がある
+    """
+    try:
+        la = _norm_len_for_surface(a); lb = _norm_len_for_surface(b)
+        p_len = min(P_LEN_CAP, P_LEN_PER_CHAR * abs(la - lb))
+    except Exception:
+        p_len = 0.0
+
+    try:
+        na = _numeric_chunk_count(a); nb = _numeric_chunk_count(b)
+        p_num = min(P_NUM_CAP, P_NUM_PER_CHUNK * abs(na - nb))
+    except Exception:
+        p_num = 0.0
+
+    try:
+        core_a = _surface_core_for_reading(a)
+        core_b = _surface_core_for_reading(b)
+        p_core = P_CORE_ASYM if bool(core_a) != bool(core_b) else 0.0
+    except Exception:
+        p_core = 0.0
+
+    return float(p_len + p_num + p_core)
+
+def combined_char_similarity(
+    a: str,
+    b: str,
+    *,
+    sa: str | None = None,
+    sb: str | None = None,
+    grams_a=None,
+    grams_b=None,
+    w_lev: float = CHAR_SIM_W_LEV,
+    w_jacc: float = CHAR_SIM_W_JACC,
+    clamp: tuple[float, float] = (0.0, 1.0),
+) -> float:
+    """
+    文字ベースの最終スコア：
+        raw = w_lev * Levenshtein_sim  +  w_jacc * Jaccard2
+        score = clamp(raw - penalty)
+
+    - sa/sb: NFKC 済み表層を渡すと再正規化を避けられます
+    - grams_a/grams_b: 2-gram 集合（frozenset など）を渡すと再構築を避けられます
+    - 戻り値は [0.000, 1.000] に丸め（小数第3位）
+    """
+    # NFKC 済みを尊重（未指定なら正規化）
+    sa = nfkc(sa if sa is not None else (a or ""))
+    sb = nfkc(sb if sb is not None else (b or ""))
+
+    # 完全一致は 1.0（basic）
+    if sa == sb:
+        return 1.0
+
+    # 成分スコア
+    jacc = _jaccard_2gram(sa, sb, grams_a, grams_b)
+    levs = _lev_sim(sa, sb)
+    raw  = (w_lev * levs) + (w_jacc * jacc)
+    raw  = max(clamp[0], min(clamp[1], raw))
+
+    # 軽い機械ペナルティ
+    pen = _char_penalty(a, b)
+    score = max(clamp[0], min(clamp[1], raw - pen))
+
+    return round(float(score), 3)
 
 # ===== Edge-only difference (first/last 1-char) =====
 def classify_edge_diff(a: str, b: str) -> str:
@@ -486,50 +1569,94 @@ def _edge_labels_vectorized(df: pd.DataFrame) -> pd.Series:
     res = res.mask(m, "後1字違い")
     return res
 
-def _numeric_only_label_vectorized(df: pd.DataFrame) -> pd.Series:
-    a = df["a"].astype("string")
-    b = df["b"].astype("string")
-    diff_orig = (a != b)
-    has_digit = a.str.contains(_DIGIT_RE) | b.str.contains(_DIGIT_RE)
-    a_wo = a.str.replace(_DIGIT_RE, "", regex=True)
-    b_wo = b.str.replace(_DIGIT_RE, "", regex=True)
-    mask = diff_orig & has_digit & (a_wo == b_wo)
-    out = pd.Series("", index=df.index, dtype="string")
-    out[mask] = "数字以外一致"
-    return out
+# ============================================================================
+# 強化版：数字以外一致（数字「まとまり」を無視して比較）
+# 目的:
+#   - 数字そのものだけでなく、数字に付随する桁区切り（, / スペース / NBSP 等）
+#     や小数点（. / 全角．）などを含む “数字のまとまり” を丸ごと無視して比較します。
+#   - 内部判定は NFKC 正規化で行い、全角・半角の違いも吸収します。
+#   - 例: 「1,000」↔「900」「0.1」↔「1」「ver1.2.3」↔「ver2」 などを “数字以外一致” と判定。
+# 備考:
+#   - “数字以外一致” とする条件は従来どおり
+#       ① 元文字列が完全一致ではない
+#       ② 少なくとも片方に数字が含まれる（NFKC基準）
+#       ③ “数字のまとまり” を取り除いた残りが一致
+#     の3点です。
 # ============================================================================
 
-# ==== 数字以外一致（数字を全削除して比較） ====
-def strip_digits_norm(s: str) -> str:
-    """
-    文字列 s から「十進数字（Unicode Nd）」だけを除去した文字列を返す。
-    ※ ここでは NFKC 正規化は行わない（全角/半角など非数字差を温存する）
-    """
-    if not isinstance(s, str):
-        s = "" if s is None else str(s)
-    return _DIGIT_RE.sub("", s)
+# 数字「まとまり」を検出する正規表現（NFKC 後に適用）
+#  - 先頭に +/- 記号を許容
+#  - 中にカンマ/ドット/空白を挟みつつ最後は数字で終わる連なりを1塊とみなす
+#  - 例: 123 / 1,234 / 1 234 / 1 234 / 0.5 / 1.2.3 / １２，３４５．６（NFKCで吸収）
+_NUMERIC_CHUNK_RE = re.compile(r"[+\-]?\d(?:[\d,.\s]*\d)?")
+
+# 空白の正規化（半角スペース/全角スペースを1個の半角スペースに）
+_WS_RE = re.compile(r"[\s\u3000]+")
+
+def _strip_numbers_like(s: str) -> str:
+    """文字列から『数字のまとまり』をすべて除去し、残りを空白正規化して返す。"""
+    if s is None:
+        s = ""
+    s = str(s)
+    # 内部のみ NFKC（全角→半角、全角記号→半角記号 等）
+    nf = unicodedata.normalize("NFKC", s)
+    # 数字まとまりを空文字へ（桁区切り・小数点・連続ドット等を含めて除去）
+    t = _NUMERIC_CHUNK_RE.sub("", nf)
+    # 余計な空白を整理（比較を安定化）
+    t = _WS_RE.sub(" ", t).strip()
+    return t
 
 def is_numeric_only_diff(a: str, b: str) -> bool:
     """
     a, b が“数字だけ異なる”なら True。
     条件:
-      - a != b（元が同一なら False）
-      - 片方以上に十進数字が含まれる
-      - 十進数字をすべて除去した結果が一致する
-    例:
-      True:  "3kg" vs "３kg", "年1回" vs "年2回", "ver1.0" vs "ver１.0"
-      False: "kg" vs "ｋg"（数字なし・幅違い）、"(" vs "（"（数字なし・記号幅違い）
+      - a != b（元が同一は False）
+      - 少なくとも片方に数字（NFKC基準）が含まれる
+      - 数字まとまりを除去した残りが一致
     """
-    if a is None or b is None:
+    if a is None and b is None:
         return False
-    a_s, b_s = str(a), str(b)
+    a_s, b_s = "" if a is None else str(a), "" if b is None else str(b)
     if a_s == b_s:
         return False
-    # 少なくともどちらかに「数字」が含まれていること
-    if not (_DIGIT_RE.search(a_s) or _DIGIT_RE.search(b_s)):
+    # 少なくとも一方に数字があるか（NFKC後に判定）
+    a_has = bool(re.search(r"\d", unicodedata.normalize("NFKC", a_s)))
+    b_has = bool(re.search(r"\d", unicodedata.normalize("NFKC", b_s)))
+    if not (a_has or b_has):
         return False
-    # 数字を除去した残りが完全一致なら「数字だけ違う」
-    return strip_digits_norm(a_s) == strip_digits_norm(b_s)
+    # 数字のまとまりを除去して比較
+    return _strip_numbers_like(a_s) == _strip_numbers_like(b_s)
+
+def numeric_only_label(a: str, b: str) -> str:
+    """表示用ラベル（該当時のみ '数字以外一致' を返す）"""
+    return "数字以外一致" if is_numeric_only_diff(a, b) else ""
+
+def _numeric_only_label_vectorized(df: pd.DataFrame) -> pd.Series:
+    """
+    DataFrame（a,b列）に対してベクトル風に '数字以外一致' を判定する。
+    - 内部では NFKC + 数字まとまり除去で比較
+    - a,b が同一の行は除外
+    - 少なくとも片方に数字がある行のみ対象
+    """
+    a = df["a"].astype("string")
+    b = df["b"].astype("string")
+
+    # 事前条件: 元が同一は対象外
+    diff_orig = (a != b)
+
+    # “数字が含まれるか” の判定は NFKC 後に実施
+    a_nf = a.map(lambda x: unicodedata.normalize("NFKC", "" if pd.isna(x) else str(x)))
+    b_nf = b.map(lambda x: unicodedata.normalize("NFKC", "" if pd.isna(x) else str(x)))
+    has_digit = a_nf.str.contains(r"\d") | b_nf.str.contains(r"\d")
+
+    # 数字まとまりを除去して比較
+    a_stripped = a.map(_strip_numbers_like)
+    b_stripped = b.map(_strip_numbers_like)
+
+    mask = diff_orig & has_digit & (a_stripped == b_stripped)
+    out = pd.Series("", index=df.index, dtype="string")
+    out[mask] = "数字以外一致"
+    return out
 
 def numeric_only_label(a: str, b: str) -> str:
     """表示用ラベル（該当時のみ '数字以外一致' を返す）"""
@@ -597,18 +1724,28 @@ def build_synonym_pairs_general(
     words   = df_lex["surface"].tolist()
     counts  = df_lex["count"].tolist()
     lemmas  = df_lex["lemma"].fillna("").tolist()
-    lemma_reads = df_lex["lemma_read"].fillna("").tolist()
-    readings = df_lex["reading"].fillna("").tolist()
+    readings= df_lex["reading"].fillna("").tolist()
 
     n = len(words)
     norm_surface = [nfkc(w) for w in words]
     norm_read    = [normalize_kana(r or "", True) for r in readings]
-
-    # 追加：n-gram セット前計算（文字類似の粗フィルタ）
-    ng_char = [_ngram_set(s) for s in norm_surface]
+    ng_char      = [_ngram_set(s) for s in norm_surface]
 
     rows = []
     step = max(1, n // 100)
+
+    # 内部ユーティリティ：読み類似を第1/第2パスで試す
+    def try_reading_like(a, b, ra, rb, th):
+        # 第1パス：既定しきい値
+        sim = reading_sim_with_penalty(a, b, ra, rb, th)
+        if sim is not None:
+            return sim
+        # 第2パス：漢字↔カナ 等の取り合わせは しきい値を少し緩める
+        if _has_kanji(a) != _has_kanji(b):
+            th2 = max(0.75, float(th) - 0.15)  # 例：0.90 → 0.75
+            return reading_sim_with_penalty(a, b, ra, rb, th2)
+        return None
+
     for i in range(n):
         for j in range(i + 1, n):
             a, b   = words[i], words[j]
@@ -620,36 +1757,45 @@ def build_synonym_pairs_general(
             reason = None
             score  = 0.0
 
-            # 1) 基本形（lemma）一致を最優先
+            # 1) lemma 優先（既存）
             if la and lb and la == lb and a != b:
-                # lemmaそのものが片方の表層に一致なら "lemma"、それ以外は活用差とみなす
                 if (a == la) or (b == la):
                     reason, score = "lemma", 1.0
                 else:
                     reason, score = "inflect", 0.95
+
             else:
-                # 2) 読み類似：長さ差ゲート + 帯付きLevenshtein
-                if ra and rb:
-                    sim_r = sim_with_threshold(ra, rb, read_sim_th)
+                # 1.5) 読み一致（英数記号除く）= 和字コア一致のみ
+                if is_symbol_only_surface_diff(a, b) and a != b:
+                    reason, score = "reading_eq", reading_eq_score(a, b)
+
+                else:
+                    # 2) 読み類似（第1/第2パス）
+                    sim_r = try_reading_like(a, b, ra, rb, read_sim_th)
                     if sim_r is not None:
-                        reason, score = "reading", round(sim_r, 3)
-                # 3) 文字類似：長さ差ゲート + n-gram 粗フィルタ + 帯付きLevenshtein
-                if reason is None:
-                    # 長さ差ゲート
-                    L  = max(len(sa), len(sb))
-                    kC = int((1.0 - char_sim_th) * L)
-                    if abs(len(sa) - len(sb)) <= kC:
-                        # n-gram 粗フィルタ
+                        reason, score = "reading", round(float(sim_r), 3)
+
+                    else:
+                        # 3) 文字類似（合成：2-gram Jaccard × Levenshtein + 軽ペナルティ）
                         inter = len(ng_char[i] & ng_char[j])
                         union = len(ng_char[i] | ng_char[j])
+                        # 粗フィルタ（Jaccard 0.30 以上だけ本評価）
                         if union > 0 and (inter / union) >= 0.30:
-                            sim_c = sim_with_threshold(sa, sb, char_sim_th)
-                            if sim_c is not None:
-                                reason, score = "char", round(sim_c, 3)
+                            sim_val = combined_char_similarity(
+                                a, b,
+                                sa=sa, sb=sb,
+                                grams_a=ng_char[i], grams_b=ng_char[j],
+                            )
+                            if sim_val >= 0.999:
+                                reason, score = "basic", 1.0
+                            elif sim_val is not None and sim_val >= float(char_sim_th or 0.0):
+                                reason, score = "char", sim_val
+                            # ※ しきい値未満は reason=None のまま → 行は追加しない
 
             if reason:
                 rows.append({
-                    "a": a, "b": b, "a_count": ca, "b_count": cb,
+                    "a": a, "b": b,
+                    "a_count": ca, "b_count": cb,
                     "reason": reason, "score": score, "scope": scope
                 })
 
@@ -698,15 +1844,16 @@ import math
 def _pairs_chunk_worker(args):
     """
     子プロセス側：i 範囲を担当し、逆引きインデックスで候補を前絞りしてから判定。
+    文字類似は「2-gram Jaccard × Levenshtein の合成 + 軽ペナルティ」を用いる。
     """
     (i_start, i_end, words, counts, norm_char, read_norm,
      ngram_list, char_sim_th, read_sim_th, scope) = args
 
     rows = []
     n = len(words)
-    JACC_TH = 0.30
+    JACC_TH = 0.30  # 粗フィルタ用（前段の足切り）
 
-    # ここで一度だけ逆引きインデックスを構築（各ワーカー内で）
+    # 逆引きインデックス（ローカル構築）
     from collections import defaultdict
     inv = defaultdict(list)
     for idx, grams in enumerate(ngram_list):
@@ -715,52 +1862,90 @@ def _pairs_chunk_worker(args):
     for g, lst in inv.items():
         inv[g] = sorted(set(lst))
 
+    # 読み類似（第1/第2パス）
+    def try_reading_like(a, b, ra, rb, th):
+        sim = reading_sim_with_penalty(a, b, ra, rb, th)
+        if sim is not None:
+            return sim
+        if _has_kanji(a) != _has_kanji(b):
+            th2 = max(0.75, float(th) - 0.15)
+            return reading_sim_with_penalty(a, b, ra, rb, th2)
+        return None
+
     for i in range(i_start, i_end):
-        a = words[i]
+        a  = words[i]
         sa = norm_char[i]
         Ai = ngram_list[i]
 
-        # --- 候補を前絞り ---
+        # まず 2-gram の共起から候補集合
         pool = set()
         for g in Ai:
             pool.update(inv.get(g, ()))
         cand_js = [j for j in pool if j > i and j < n]
 
         for j in cand_js:
-            b = words[j]
+            b  = words[j]
 
-            # 読み類似（優先）
-            if read_sim_th is not None and read_norm[i] and read_norm[j]:
-                sim_r = sim_with_threshold(read_norm[i], read_norm[j], read_sim_th)
+            # 【読み一致（和字コア一致のみ）→ 既存ロジック】
+            if read_sim_th is not None and is_symbol_only_surface_diff(a, b) and a != b:
+                rows.append({
+                    "a": a, "b": b,
+                    "a_count": counts[a], "b_count": counts[b],
+                    "reason": "reading_eq",
+                    "score": reading_eq_score(a, b),
+                    "scope": scope,
+                })
+                continue
+
+            # 【読み類似】（既存）
+            if read_sim_th is not None:
+                ra = read_norm[i] if read_norm[i] is not None else ""
+                rb = read_norm[j] if read_norm[j] is not None else ""
+                sim_r = try_reading_like(a, b, ra, rb, read_sim_th)
                 if sim_r is not None:
                     rows.append({
                         "a": a, "b": b,
                         "a_count": counts[a], "b_count": counts[b],
                         "reason": "reading",
-                        "score": round(sim_r, 3),
-                        "scope": scope
+                        "score": round(float(sim_r), 3),
+                        "scope": scope,
                     })
                     continue
 
-            # 文字類似：粗→本審査
+            # 【文字類似】ここを “合成スコア” に差し替え
             Aj = ngram_list[j]
             inter = len(Ai & Aj)
             union = len(Ai | Aj)
-            if union == 0 or (inter / union) < JACC_TH:
+            if union == 0:
+                continue
+            jacc = inter / union
+            if jacc < JACC_TH:  # 粗フィルタ
                 continue
 
             sb = norm_char[j]
-            sim_c = sim_with_threshold(sa, sb, char_sim_th)
-            if sim_c is not None:
+            sim_val = combined_char_similarity(
+                a, b,
+                sa=sa, sb=sb,
+                grams_a=Ai, grams_b=Aj,
+            )
+
+            # 完全一致は "basic"、それ以外は "char"
+            if sim_val >= 0.999:
                 rows.append({
                     "a": a, "b": b,
                     "a_count": counts[a], "b_count": counts[b],
-                    "reason": "char",
-                    "score": round(sim_c, 3),
-                    "scope": scope
+                    "reason": "basic", "score": 1.0,
+                    "scope": scope,
                 })
+            elif sim_val >= float(char_sim_th or 0.0):
+                rows.append({
+                    "a": a, "b": b,
+                    "a_count": counts[a], "b_count": counts[b],
+                    "reason": "char", "score": sim_val,
+                    "scope": scope,
+                })
+
     return rows
-# =======================================================================
 
 def build_synonym_pairs_char_only(
     tokens: List[Tuple[str,int]],
@@ -868,7 +2053,16 @@ def build_synonym_pairs_char_only(
 # ------------------------------------------------------------
 # 統合（★「読み類似」を最優先）
 # ------------------------------------------------------------
-REASON_PRIORITY = {"reading": 6.0, "lemma": 5.0, "inflect": 4.5, "lemma_read": 4.0, "char": 2.0}
+REASON_PRIORITY = {
+    # new: 厳密一致に相当（NFKC同一）を最上位に
+    "basic": 7.2,                 # ★ 追加：基本一致
+    "reading_eq": 6.8,
+    "reading": 6.0,
+    "lemma": 5.0,
+    "inflect": 4.5,
+    "lemma_read": 4.0,
+    "char": 2.0,
+}
 
 def unify_pairs(*dfs: pd.DataFrame) -> pd.DataFrame:
     frames = []
@@ -998,22 +2192,36 @@ def build_variation_groups(df_unified: pd.DataFrame, df_lex: Optional[pd.DataFra
     )
     return df_groups, surf2gid, gid2members
 
-# ------------------------------------------------------------
-# 表示用：英→日本語（列名）
-# ------------------------------------------------------------
-REASON_JA_MAP = {
-    "lemma": "基本形一致",
-    "lemma_read": "基本形の読み一致",
+# ==== ここから差し替え：2→3分類に拡張（新カテゴリを表示側に追加） ====
+REASON_TO_GROUP = {
+    "basic": "basic",             # ★ 追加
+    "reading_eq": "reading_eq",
+    "lemma": "reading",
+    "lemma_read": "reading",
+    "reading": "reading",
+    "inflect": "reading",
+    "char": "char",
+}
+
+
+REASON_GROUP_JA = {
+    "basic": "基本一致",                # ★ 追加
+    "reading_eq": "読み一致（英数記号除く）",
     "reading": "読み類似",
     "char": "文字類似",
-    "inflect": "活用違い",
 }
+
 def apply_reason_ja(df: pd.DataFrame) -> pd.DataFrame:
-    """reason列（英）→ 一致要因（日本語）列に置換"""
+    """
+    reason列（英）→ 「一致要因」（日本語）の3分類に変換。
+    - 未知のreasonは安全側で「文字類似」にフォールバック。
+    - 最終的に「reason」列は削除。
+    """
     if df is None or df.empty or "reason" not in df.columns:
         return df
     df = df.copy()
-    df["一致要因"] = df["reason"].map(REASON_JA_MAP).fillna(df["reason"])
+    grp_key = df["reason"].map(REASON_TO_GROUP).fillna("char")
+    df["一致要因"] = grp_key.map(REASON_GROUP_JA).fillna("文字類似")
     df = df.drop(columns=["reason"])
     return df
 
@@ -1497,7 +2705,19 @@ class UnifiedModel(QAbstractTableModel):
             if c == 0:
                 return None
             v = self._df.iat[r, c - 1]
-            return "" if pd.isna(v) else str(v)
+            if pd.isna(v):
+                return ""
+            # ★ score 列だけは小数点第3位で固定表示
+            try:
+                col_name = self._df.columns[c - 1]
+            except Exception:
+                col_name = ""
+            if col_name == "score":
+                try:
+                    return f"{float(v):.3f}"
+                except Exception:
+                    return str(v)
+            return str(v)
 
         # ツールチップ：a / b 列だけ簡易差分HTML（A上/B下）
         if role == Qt.ToolTipRole:
@@ -1961,6 +3181,23 @@ class AnalyzerWorker(QObject):
             df_unified = unify_pairs(df_pairs_lex_general, df_pairs_compound, df_pairs_bunsetsu)
             self._emit(88)
 
+            # 88.5%: 読み系（lemma/inflect/reading...）を再採点（既存）
+            df_unified = recalibrate_reading_like_scores(df_unified, read_th=self.read_th)
+
+            # 88.6%: ★最終スコアを combined に強制（score_reasonは作らない・既存も捨てる）
+            df_unified = enforce_combined_similarity_score(
+                df_unified,
+                keep_backup=False,
+                drop_existing_backup=True,
+            )
+
+            # 88.7%: ★「読み一致で 1.0」は 'basic' に付け替え
+            df_unified = reclassify_basic_for_reading_eq(df_unified, eps=0.0005)
+
+            # 89%: 小数第3位に丸め（念のため整合）
+            if df_unified is not None and not df_unified.empty and "score" in df_unified.columns:
+                df_unified["score"] = pd.to_numeric(df_unified["score"], errors="coerce").round(3)
+
             # 90%: 単独仮名除去
             if not df_unified.empty and "a" in df_unified.columns:
                 df_unified = df_unified[~df_unified["a"].apply(is_single_kana_char)].reset_index(drop=True)
@@ -1979,7 +3216,7 @@ class AnalyzerWorker(QObject):
                 df_tokens = df_tokens["type token count".split()].sort_values(["type", "count", "token"], ascending=[True, False, True])
             self._emit(92)
 
-            # 93%: 表示用ラベル変換（既存）
+            # 93%: 表示用ラベル変換（2分類）
             df_unified = apply_reason_ja(df_unified)
 
             # 93.5%: 端差 / 数字以外一致（ベクトル化に置換）
@@ -2156,7 +3393,7 @@ class DropArea(QTextEdit):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("PDF 表記ゆれチェック [ver.1.20]"); self.resize(1180, 860)
+        super().__init__(); self.setWindowTitle("PDF 表記ゆれチェック [ver.1.30]"); self.resize(1180, 860)
         central = QWidget(); self.setCentralWidget(central)
         root = QHBoxLayout(central)
 
@@ -2248,13 +3485,18 @@ class MainWindow(QMainWindow):
         sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine); sep2.setFrameShadow(QFrame.Sunken)
         v_filters.addWidget(sep2)
 
-        # 3) 一致要因フィルタ行
+        # 3) 一致要因フィルタ行（2分類に集約）
         row_reason = QHBoxLayout(); row_reason.setSpacing(8)
         row_reason.addWidget(QLabel("一致要因:"))
-        self.reason_labels = ["基本形一致","基本形の読み一致","読み類似","文字類似","活用違い"]
+
+        # 一致要因（表示ラベル）
+        self.reason_labels = ["基本一致", "読み一致（英数記号除く）", "読み類似", "文字類似"]  # ★ 先頭に追加
         self.chk_reasons: Dict[str, QCheckBox] = {}
         for r in self.reason_labels:
-            cb = QCheckBox(r); cb.setChecked(True); self.chk_reasons[r] = cb
+            cb = QCheckBox(r)
+            cb.setChecked(True)
+            self.chk_reasons[r] = cb
+
             row_reason.addWidget(cb)
         row_reason.addStretch(1)
         v_filters.addLayout(row_reason)
@@ -2267,10 +3509,10 @@ class MainWindow(QMainWindow):
         row_edge = QHBoxLayout()
         row_edge.setSpacing(8)
         row_edge.addWidget(QLabel("特殊絞込:"))
-        self.chk_edge_prefix = QCheckBox("前1文字差を非表示")
-        self.chk_edge_suffix = QCheckBox("後1文字差を非表示")
+        self.chk_edge_prefix = QCheckBox("前1文字差を隠す")
+        self.chk_edge_suffix = QCheckBox("後1文字差を隠す")
         # ★追加：数字以外一致
-        self.chk_num_only = QCheckBox("数字以外一致を非表示")
+        self.chk_num_only = QCheckBox("数字以外一致を隠す")
 
         self.chk_edge_prefix.setChecked(False)  # ★初期OFF
         self.chk_edge_suffix.setChecked(False)  # ★初期OFF
@@ -2835,18 +4077,24 @@ class MainWindow(QMainWindow):
                         if not ok:
                             ws.set_row(i + 1, None, None, {'hidden': True})
 
-                    # ❹ 列幅
-                    num_fmt = wb.add_format({"align": "right"})
+
+                    # ❹ 列幅と書式
+                    num_fmt_int = wb.add_format({"align": "right"})          # 既存の数値右寄せ
+                    num_fmt_3   = wb.add_format({"num_format": "0.000", "align": "right"})  # ★ 3桁小数
+
                     def set_w(name, width, fmt=None):
                         ci = col_idx(name)
                         if ci is not None:
                             ws.set_column(ci, ci, width, fmt)
+
                     set_w("選択", 7)
-                    set_w("gid", 7, num_fmt)
-                    set_w("字数", 6, num_fmt)
+                    set_w("gid", 7, num_fmt_int)
+                    set_w("字数", 6, num_fmt_int)
                     set_w("a", 32); set_w("b", 32)
                     set_w("一致要因", 12); set_w("対象", 10)
                     set_w("端差", 10); set_w("数字以外一致", 12)
+                    set_w("score", 8, num_fmt_3)  # ★ 追加：score を 0.000 で固定
+
 
                 else:
                     # openpyxl：枠＋B2固定＋非該当行の非表示
