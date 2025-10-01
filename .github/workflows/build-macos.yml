@@ -147,6 +147,7 @@ jobs:
           echo ">>> Running: pyinstaller ${OPTS[*]} \"$ENTRYPOINT\""
           pyinstaller "${OPTS[@]}" "$ENTRYPOINT"
 
+
       - name: Pack .dmg (compressed) & keep only .dmg
         shell: bash
         run: |
@@ -154,9 +155,20 @@ jobs:
           cd dist
           APP="${APP_NAME}.app"
           DMG="${APP_NAME}-${{ matrix.runner }}.dmg"
+      
+          # 既存のマウント解除＆DMG削除
+          hdiutil detach "/Volumes/${APP_NAME}" || true
+          rm -f "${DMG}"
+      
+          # 念のため待機
+          sleep 2
+      
+          # DMG作成
           hdiutil create -volname "${APP_NAME}" -srcfolder "${APP}" -ov -format UDZO "${DMG}"
+      
+          # .app を削除してDMGだけ残す
           rm -rf "${APP}"
-          ls -al
+
 
       - name: Upload artifact (.dmg only)
         uses: actions/upload-artifact@v4
