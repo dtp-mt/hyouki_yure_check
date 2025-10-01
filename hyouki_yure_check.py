@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Set
 import fitz  # PyMuPDF
 import pandas as pd
+
 from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Signal, QObject, QThread, QRect,
-    QTimer, QCollator, QPoint
+    QTimer, QCollator, QPoint, QSize   # ← これを追加
 )
+
 from PySide6.QtGui import (
     QFont, QPalette, QColor, QPainter, QPen, QAction
 )
@@ -3118,27 +3120,43 @@ class UnifiedModel(QAbstractTableModel):
             self._checks[i] = checked
         self.dataChanged.emit(self.index(0,0), self.index(len(self._checks)-1,0), [Qt.CheckStateRole])
 
+# ===== [REPLACE] CheckBoxDelegate（センター描画 + sizeHint + __init__） =====
 class CheckBoxDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def sizeHint(self, option, index):
+        # セルの推奨サイズ（高さに追随しつつ 16px 基準）
+        h = max(16, option.rect.height())
+        return QSize(h, h)
+
     def paint(self, painter: QPainter, option, index):
         if index.column() != 0:
             return super().paint(painter, option, index)
+
         state = index.model().data(index, Qt.CheckStateRole)
         rect = option.rect
-        size = min(rect.height(), 16)
+        size = min(rect.height(), 16)  # 16px を目安
         x = rect.x() + (rect.width() - size) // 2
         y = rect.y() + (rect.height() - size) // 2
         r = QRect(x, y, size, size)
+
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        pen = QPen(QColor("#111")); pen.setWidth(1); painter.setPen(pen); painter.setBrush(QColor("#fff"))
+        # 枠
+        pen = QPen(QColor("#111")); pen.setWidth(1)
+        painter.setPen(pen); painter.setBrush(QColor("#fff"))
         painter.drawRoundedRect(r, 2, 2)
+        # チェック
         if state == Qt.Checked:
-            pen = QPen(QColor("#111")); pen.setWidth(2); painter.setPen(pen)
+            pen = QPen(QColor("#111")); pen.setWidth(2)
+            painter.setPen(pen)
             x1 = r.x() + int(size*0.22); y1 = r.y() + int(size*0.56)
             x2 = r.x() + int(size*0.46); y2 = r.y() + int(size*0.80)
             x3 = r.x() + int(size*0.80); y3 = r.y() + int(size*0.28)
             painter.drawLine(x1,y1,x2,y2); painter.drawLine(x2,y2,x3,y3)
         painter.restore()
+# ===== [/REPLACE] ===========================================================
 
 class HighContrastCheckboxStyle(QProxyStyle):
     def pixelMetric(self, metric, option=None, widget=None):
@@ -4086,6 +4104,13 @@ class MainWindow(QMainWindow):
         self.proxy_tokens.setFilterKeyColumn(1)  # tokens: 0:type, 1:token, 2:count
 
         self.view_unified.setModel(self.proxy_unified)
+        # ===== [PATCH] MainWindow.__init__ の「モデル/ビュー接続」直後に追記 =====
+        self.view_unified.setModel(self.proxy_unified)
+        # チェック列（0列）の描画をセンター揃えデリゲートに
+        self.view_unified.setItemDelegateForColumn(0, CheckBoxDelegate(self.view_unified))
+        # ヘッダは中央寄せ（✓ ヘッダも中央に）
+        self.view_unified.horizontalHeader().setDefaultAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        # ===== [/PATCH] =============================================================
         # ===== [PATCH] 選択変更で差分プレビュー更新 =====
         self.view_unified.selectionModel().selectionChanged.connect(self.on_unified_selection_changed)
         # ===== [/PATCH] =================================
@@ -4133,6 +4158,7 @@ class MainWindow(QMainWindow):
     # =========================================================
     # 小ユーティリティ
     # =========================================================
+    # ===== [REPLACE] MainWindow._make_table（Stretch無効 + ヘッダ中央 + スクロール） =====
     def _make_table(self) -> QTableView:
         tv = QTableView()
         tv.setSortingEnabled(True)
@@ -4141,10 +4167,19 @@ class MainWindow(QMainWindow):
         tv.setSelectionMode(QAbstractItemView.SingleSelection)
         tv.verticalHeader().setVisible(False)
         tv.verticalHeader().setDefaultSectionSize(28)
-        tv.horizontalHeader().setStretchLastSection(True)
+        # ★ ここを False に（最終列が余白で勝手に広がらない）
+        tv.horizontalHeader().setStretchLastSection(False)
         tv.horizontalHeader().setHighlightSections(False)
-        tv.setShowGrid(True)
+        # ★ ヘッダの文字揃えを中央へ
+        tv.horizontalHeader().setDefaultAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
+        # スクロールの手触り
+        tv.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        tv.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        # テキストは折り返さず、長い時は右側省略
+        tv.setWordWrap(False)
+        tv.setTextElideMode(Qt.ElideRight)
         return tv
+    # ===== [/REPLACE] ===========================================================
 
     def _make_table_simple(self) -> QTableView:
         return self._make_table()
@@ -4220,6 +4255,7 @@ class MainWindow(QMainWindow):
                 hdr.setSectionResizeMode(c, QHeaderView.Fixed)
                 view.setColumnHidden(c, True)
 
+    # ===== [REPLACE] MainWindow._compact_columns（非 a/b 列を Fixed + 上限幅） =====
     def _compact_columns(self):
         view = self.view_unified
         model = view.model()
@@ -4227,22 +4263,30 @@ class MainWindow(QMainWindow):
             return
         hdr = view.horizontalHeader()
         hdr.setMinimumSectionSize(40)
+
         NUMERIC = {"gid", "字数", "a_count", "b_count", "a数", "b数", "score", "類似度"}
-        LABELS = {"一致要因", "理由", "対象", "scope", "target"}
+        LABELS  = {"一致要因", "理由", "対象", "scope", "target"}
+
+        # 列名→インデックスを走査
         for c in range(model.columnCount()):
             name = (model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "").strip()
             if name in {"a", "b"}:
+                # a/b はユーザー操作しやすいよう Interactive（幅は別関数で上限クリップ）
                 hdr.setSectionResizeMode(c, QHeaderView.Interactive)
                 continue
+
+            # a/b 以外は Fixed + 上限幅で抑制
             if name in NUMERIC:
                 max_w = 88 if name not in {"gid", "字数"} else 72
             elif name in LABELS:
                 max_w = 120
             else:
-                max_w = 160
-            w = view.columnWidth(c)
-            view.setColumnWidth(c, min(max_w, w if w > 0 else max_w))
-            hdr.setSectionResizeMode(c, QHeaderView.Interactive)
+                max_w = 140  # その他は 140px 上限
+
+            # 現在幅と上限を比較してセット
+            cur = view.columnWidth(c)
+            view.setColumnWidth(c, min(max_w, cur if cur > 0 else max_w))
+            hdr.setSectionResizeMode(c, QHeaderView.Fixed)
 
     # =========================================================
     # DnD & 入出力
