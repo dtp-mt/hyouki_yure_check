@@ -139,6 +139,8 @@ jobs:
             --collect-data sudachipy
             --collect-all spacy_legacy
             --collect-submodules ginza
+            --collect-submodules spacy
+            --collect-submodules sudachipy
             --additional-hooks-dir hooks
           )
 
