@@ -131,11 +131,13 @@ jobs:
             --hidden-import ja_ginza
             --hidden-import sudachipy
             --hidden-import spacy.lang.ja
+            --hidden-import spacy_legacy
             --collect-data spacy
             --collect-data ginza
             --collect-data ja_ginza
             --collect-data sudachidict_core
             --collect-data sudachipy
+            --collect-all spacy_legacy
             --collect-submodules ginza
             --additional-hooks-dir hooks
           )
