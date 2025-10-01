@@ -16,13 +16,16 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QFont, QPalette, QColor, QPainter, QPen, QAction
 )
+# ===== [PATCH] import QSizePolicy =====
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTableView, QTabWidget, QLineEdit, QDoubleSpinBox, QSpinBox,
-    QGroupBox, QFormLayout, QMessageBox, QTextEdit, QProgressBar, QAbstractItemView,
+    QGroupBox, QFormLayout, QMessageBox, QTextEdit, QTextBrowser, QProgressBar, QAbstractItemView,
     QListWidget, QCheckBox, QStyledItemDelegate, QStyle, QProxyStyle,
-    QMenu, QDialog, QDialogButtonBox, QFrame
+    QMenu, QDialog, QDialogButtonBox, QFrame, QHeaderView, QSizePolicy
 )
+# ===== [/PATCH] ======================
+
 from PySide6.QtWidgets import QHeaderView
 # 先頭の import 群のどこかに追加
 from PySide6.QtCore import QUrl
@@ -1327,6 +1330,58 @@ def ginza_bunsetsu_chunks(text: str) -> list[str]:
     return chunks
 # ===== 差し替えここまで =====
 
+# ===== 追加: GiNZA 文章（文）抽出 =====
+def ginza_sentence_units(text: str, *, max_len: int = 300) -> list[str]:
+    """
+    レイアウト由来のセグメント毎に GiNZA を流し、doc.sents で文単位に抽出。
+    改行・タブは空白1個に正規化し、1..max_len だけ採用。
+    GiNZA が無い場合は句読点（。！？）ベースの簡易分割でフォールバック。
+    """
+    if not isinstance(text, str) or not text:
+        return []
+
+    # --- GiNZA あり: spaCy doc.sents で文抽出 ---
+    ok = HAS_GINZA and (GINZA_NLP is not None)
+    if ok:
+        try:
+            # 実行時も parser / bunsetu_recognizer を有効（parser があれば sents が出ます）
+            pipes_to_enable = [p for p in GINZA_ENABLED_COMPONENTS if p in GINZA_NLP.pipe_names]
+            chunks: list[str] = []
+            segs = [seg for seg in iter_nlp_segments(text)]
+            if not segs:
+                return []
+
+            # 並列・バッチ設定は bunsetsu と揃える
+            try:
+                n_process = max(1, int(os.environ.get("GINZA_N_PROCESS", "1")))
+            except Exception:
+                n_process = 1
+            try:
+                batch_size = max(1, int(os.environ.get("GINZA_BATCH_SIZE", "64")))
+            except Exception:
+                batch_size = 64
+
+            with GINZA_NLP.select_pipes(enable=pipes_to_enable):
+                for doc in GINZA_NLP.pipe(segs, n_process=n_process, batch_size=batch_size):
+                    for sent in doc.sents:
+                        s = re.sub(r"[\t\r\n]+", " ", sent.text).strip()
+                        if 1 <= len(s) <= max_len:
+                            chunks.append(s)
+            return chunks
+        except Exception:
+            # 下のフォールバックへ
+            pass
+
+    # --- フォールバック（GiNZA なし／失敗時）: 句読点ベースの簡易文分割 ---
+    out: list[str] = []
+    for seg in iter_nlp_segments(text):
+        for s in re.split(r"(?<=[。！？!?.])\s*", seg):
+            s = re.sub(r"[\t\r\n]+", " ", s).strip()
+            if 1 <= len(s) <= max_len:
+                out.append(s)
+    return out
+# ===== 追加ここまで =====
+
 # ------------------------------------------------------------
 # MeCab helpers
 # ------------------------------------------------------------
@@ -1593,6 +1648,27 @@ def extract_candidates_bunsetsu(
     arr = [(w, c) for w, c in cnt.items() if c >= min_count]
     arr.sort(key=lambda x: (-x[1], x[0]))
     return arr if (not top_k or top_k <= 0) else arr[:top_k]
+
+# ===== 追加: 文章（文）候補抽出 =====
+def extract_candidates_sentence(
+    pages: List[PageData],
+    min_len: int = 1,
+    max_len: int = 300,
+    min_count: int = 1,
+    top_k: int = 0
+) -> List[Tuple[str, int]]:
+    cnt = Counter()
+    for p in pages:
+        # GiNZA 優先、無ければ簡易フォールバック
+        sents = ginza_sentence_units(p.text_join, max_len=max_len) if HAS_GINZA else ginza_sentence_units(p.text_join, max_len=max_len)
+        for s in sents:
+            s = strip_leading_control_chars(s)
+            if s and (min_len <= len(s) <= max_len):
+                cnt[s] += 1
+    arr = [(w, c) for w, c in cnt.items() if c >= min_count]
+    arr.sort(key=lambda x: (-x[1], x[0]))
+    return arr if (not top_k or top_k <= 0) else arr[:top_k]
+
 
 # ------------------------------------------------------------
 # Similarity
@@ -1903,51 +1979,73 @@ def collect_lexicon_general(pages: List[PageData], top_k=4000, min_count=1) -> p
         })
     return pd.DataFrame(rows)
 
+# ===== [REPLACE] build_synonym_pairs_general: 語彙を「名詞」「助・動詞」に分離 =====
 def build_synonym_pairs_general(
     df_lex: pd.DataFrame,
     read_sim_th=0.90,
     char_sim_th=0.85,
-    scope="語彙",
+    scope="語彙",          # ← 呼び出し互換のため残します（内部では無視）
     progress_cb=None
 ) -> pd.DataFrame:
+    """
+    語彙ペアの生成。scope を固定の「語彙」にせず、
+    表層ごとの最頻 pos1 を用いて「名詞」「助・動詞」に二分して付与します。
+    ・名詞 … pos1.startswith("名詞")
+    ・助・動詞 … pos1.startswith(("動詞","助動詞","形容詞"))  # 形容詞は用言としてこちらに含める
+    ペアの scope は「両方が名詞なら '名詞'、それ以外は '助・動詞'」に統一。
+    """
     if df_lex.empty:
         return empty_pairs_df()
 
-    words   = df_lex["surface"].tolist()
-    counts  = df_lex["count"].tolist()
-    lemmas  = df_lex["lemma"].fillna("").tolist()
-    readings= df_lex["reading"].fillna("").tolist()
+    # --- 表層ごとの粗カテゴリを作成（名詞 / 助・動詞） -------------------------
+    def _coarse_group(pos1: str) -> str:
+        p = str(pos1 or "")
+        if p.startswith("名詞"):
+            return "名詞"
+        if p.startswith(("動詞", "助動詞", "形容詞")):
+            return "助・動詞"
+        # 未判定は名詞扱い（多くの語彙が名詞のため安全側）
+        return "名詞"
+
+    surf_series = df_lex["surface"].astype(str)
+    pos1_series = df_lex.get("pos1", pd.Series([""] * len(df_lex)))
+    surf2group: Dict[str, str] = {s: _coarse_group(p) for s, p in zip(surf_series, pos1_series)}
+
+    # --- 既存ロジック（読み/文字類似によるペア化）は極力そのまま -------------------
+    words = df_lex["surface"].tolist()
+    counts = df_lex["count"].tolist()
+    lemmas = df_lex["lemma"].fillna("").tolist()
+    readings = df_lex["reading"].fillna("").tolist()
 
     n = len(words)
     norm_surface = [nfkc(w) for w in words]
-    norm_read    = [normalize_kana(r or "", True) for r in readings]
-    ng_char      = [_ngram_set(s) for s in norm_surface]
+    norm_read = [normalize_kana(r or "", True) for r in readings]
+    ng_char = [_ngram_set(s) for s in norm_surface]
 
     rows = []
     step = max(1, n // 100)
 
-    # 内部ユーティリティ：読み類似を第1/第2パスで試す
     def try_reading_like(a, b, ra, rb, th):
-        # 第1パス：既定しきい値
+        # 第1パス
         sim = reading_sim_with_penalty(a, b, ra, rb, th)
         if sim is not None:
             return sim
-        # 第2パス：漢字↔カナ 等の取り合わせは しきい値を少し緩める
+        # 第2パス（漢字↔カナなどは少し緩める）
         if _has_kanji(a) != _has_kanji(b):
-            th2 = max(0.75, float(th) - 0.15)  # 例：0.90 → 0.75
+            th2 = max(0.75, float(th) - 0.15)
             return reading_sim_with_penalty(a, b, ra, rb, th2)
         return None
 
     for i in range(n):
         for j in range(i + 1, n):
-            a, b   = words[i], words[j]
+            a, b = words[i], words[j]
             ca, cb = int(counts[i]), int(counts[j])
             la, lb = lemmas[i], lemmas[j]
             ra, rb = norm_read[i], norm_read[j]
             sa, sb = norm_surface[i], norm_surface[j]
 
             reason = None
-            score  = 0.0
+            score = 0.0
 
             # 1) lemma 優先（既存）
             if la and lb and la == lb and a != b:
@@ -1955,23 +2053,19 @@ def build_synonym_pairs_general(
                     reason, score = "lemma", 1.0
                 else:
                     reason, score = "inflect", 0.95
-
             else:
-                # 1.5) 読み一致（英数記号除く）= 和字コア一致のみ
+                # 1.5) 和字コア一致のみ（英数記号差）は reading_eq
                 if is_symbol_only_surface_diff(a, b) and a != b:
                     reason, score = "reading_eq", reading_eq_score(a, b)
-
                 else:
-                    # 2) 読み類似（第1/第2パス）
+                    # 2) 読み類似
                     sim_r = try_reading_like(a, b, ra, rb, read_sim_th)
                     if sim_r is not None:
                         reason, score = "reading", round(float(sim_r), 3)
-
                     else:
                         # 3) 文字類似（合成：2-gram Jaccard × Levenshtein + 軽ペナルティ）
                         inter = len(ng_char[i] & ng_char[j])
                         union = len(ng_char[i] | ng_char[j])
-                        # 粗フィルタ（Jaccard 0.30 以上だけ本評価）
                         if union > 0 and (inter / union) >= 0.30:
                             sim_val = combined_char_similarity(
                                 a, b,
@@ -1982,13 +2076,18 @@ def build_synonym_pairs_general(
                                 reason, score = "basic", 1.0
                             elif sim_val is not None and sim_val >= float(char_sim_th or 0.0):
                                 reason, score = "char", sim_val
-                            # ※ しきい値未満は reason=None のまま → 行は追加しない
 
             if reason:
+                # ★ scope を「名詞」「助・動詞」に二分
+                ga = surf2group.get(a, "名詞")
+                gb = surf2group.get(b, "名詞")
+                scope_ab = "名詞" if (ga == "名詞" and gb == "名詞") else "活用語"
+
                 rows.append({
                     "a": a, "b": b,
                     "a_count": ca, "b_count": cb,
-                    "reason": reason, "score": score, "scope": scope
+                    "reason": reason, "score": score,
+                    "scope": scope_ab,
                 })
 
         if progress_cb and (i % step == 0 or i == n - 1):
@@ -2001,6 +2100,7 @@ def build_synonym_pairs_general(
         ["reason", "score", "a_count", "b_count"],
         ascending=[True, False, False, False]
     )
+# ===== [/REPLACE] ==============================================================
 
 # ===== [6-A] 2-gram 逆引きインデックス（追加） ==========================
 from collections import defaultdict
@@ -2407,28 +2507,79 @@ import html
 def _esc_html(s: str) -> str:
     return "" if s is None else html.escape(str(s), quote=False)
 
+# ===== [REPLACE] html_inline_diff（クラス付与版：eq/tok-del/tok-ins） =====
 def html_inline_diff(a: str, b: str) -> str:
+    """
+    インライン差分を HTML で返す。
+    等しい部分: <span class='eq'>…</span>
+    削除      : <span class='tok-del'>…</span>
+    追加      : <span class='tok-ins'>…</span>
+    """
     sm = difflib.SequenceMatcher(a=a or "", b=b or "")
-    html = []
+    out = []
+    A = a or ""; B = b or ""
     for op, i1, i2, j1, j2 in sm.get_opcodes():
-        if op == 'equal':
-            html.append(_esc_html((a or "")[i1:i2]))
-        elif op == 'delete':
-            seg = _esc_html((a or "")[i1:i2])
+        if op == "equal":
+            seg = _esc_html(A[i1:i2])
             if seg:
-                html.append(f"<s style='color:#d9480f'>{seg}</s>")
-        elif op == 'insert':
-            seg = _esc_html((b or "")[j1:j2])
+                out.append(f"<span class='eq'>{seg}</span>")
+        elif op == "delete":
+            seg = _esc_html(A[i1:i2])
             if seg:
-                html.append(f"<span style='color:#1c7ed6;text-decoration:underline'>{seg}</span>")
-        elif op == 'replace':
-            del_seg = _esc_html((a or "")[i1:i2])
-            ins_seg = _esc_html((b or "")[j1:j2])
+                out.append(f"<span class='tok-del'>{seg}</span>")
+        elif op == "insert":
+            seg = _esc_html(B[j1:j2])
+            if seg:
+                out.append(f"<span class='tok-ins'>{seg}</span>")
+        elif op == "replace":
+            del_seg = _esc_html(A[i1:i2])
+            ins_seg = _esc_html(B[j1:j2])
             if del_seg:
-                html.append(f"<s style='color:#d9480f'>{del_seg}</s>")
+                out.append(f"<span class='tok-del'>{del_seg}</span>")
             if ins_seg:
-                html.append(f"<span style='color:#1c7ed6;text-decoration:underline'>{ins_seg}</span>")
-    return "".join(html)
+                out.append(f"<span class='tok-ins'>{ins_seg}</span>")
+    return "".join(out)
+# ===== [/REPLACE] =====
+
+# ===== [REPLACE] 左プレビュー: 統合インライン差分の見た目（薄い未変更＋淡背景） =====
+def build_unified_inline_diff_embed(a: str, b: str) -> str:
+    a = "" if a is None else str(a)
+    b = "" if b is None else str(b)
+    body = html_inline_diff(a, b)
+
+    css = """
+    <style>
+      html, body { margin:0; padding:0; background:#fff; }
+      body {
+        font-family: 'Yu Gothic UI','Noto Sans JP',sans-serif;
+        font-size: 16px;                /* お好みで 15〜18px */
+        line-height: 1.5; letter-spacing: .2px;
+      }
+      .box {
+        border: 1px solid #dee2e6; border-radius: 6px;
+        padding: 8px 10px; background: #fff;
+        white-space: pre-wrap; word-break: break-word;
+      }
+      /* 等しい部分：薄めのグレー（前回よりさらに薄く） */
+      .eq       { color:#94a3b8; }       /* 例: #94a3b8 / #9aa0a6 / #a0a7b1 */
+      /* 追加：青字＋淡い青背景＋下線を少し太く */
+      .tok-ins  {
+        color:#1c7ed6; background:#d0ebff;
+        text-decoration: underline;
+        text-decoration-thickness: 2px; text-underline-offset: 1px;
+        border-radius: 2px; padding: 0 1px;
+      }
+      /* 削除：赤字＋淡い赤背景＋取り消し線を少し太く */
+      .tok-del  {
+        color:#c92a2a; background:#ffe3e3;
+        text-decoration: line-through;
+        text-decoration-thickness: 2px;
+        border-radius: 2px; padding: 0 1px;
+      }
+    </style>
+    """
+    return f"<html><head>{css}</head><body><div class='box'>{body}</div></body></html>"
+
 
 def html_quick_ab_diff(a: str, b: str) -> str:
     import difflib
@@ -2546,6 +2697,97 @@ def html_quick_ab_diff(a: str, b: str) -> str:
 
     html = f"<html><head>{css}</head><body>{''.join(a_rows)}{''.join(b_rows)}</body></html>"
     return html
+
+# ===== [REPLACE] 差分プレビュー用：縦並び（見出しなし・A/B表記なし） =====
+def build_vertical_diff_html_embed(a: str, b: str) -> str:
+    """
+    簡易プレビュー向けの縦並び差分（見出しなし/A・B表記なし）。
+    上段=旧テキスト相当、下段=新テキスト相当 ですが文言は出しません。
+    """
+    import difflib, html as _html
+
+    def esc(s: str) -> str:
+        return _html.escape(s or "", quote=False)
+
+    def tok_a(a_line: str, b_line: str) -> str:
+        sm2 = difflib.SequenceMatcher(a=a_line or "", b=b_line or "")
+        parts = []
+        for op, i1, i2, j1, j2 in sm2.get_opcodes():
+            a_seg = (a_line or "")[i1:i2]
+            if op == "equal":
+                parts.append(esc(a_seg))
+            elif op in ("delete", "replace"):
+                if a_seg:
+                    parts.append(f"<span class='tok-del'>{esc(a_seg)}</span>")
+        return "".join(parts)
+
+    def tok_b(a_line: str, b_line: str) -> str:
+        sm2 = difflib.SequenceMatcher(a=a_line or "", b=b_line or "")
+        parts = []
+        for op, i1, i2, j1, j2 in sm2.get_opcodes():
+            b_seg = (b_line or "")[j1:j2]
+            if op == "equal":
+                parts.append(esc(b_seg))
+            elif op in ("insert", "replace"):
+                if b_seg:
+                    parts.append(f"<span class='tok-ins'>{esc(b_seg)}</span>")
+        return "".join(parts)
+
+    a_lines = (a or "").splitlines()
+    b_lines = (b or "").splitlines()
+    sm = difflib.SequenceMatcher(a=a_lines, b=b_lines)
+    ops = sm.get_opcodes()
+
+    css = """
+    <style>
+      body { background:#fff; color:#111; font-family:'Yu Gothic UI','Noto Sans JP',sans-serif;
+             font-size:13px; line-height:1.6; margin:0; }
+      .sec { margin:0 0 6px 0; }
+      .box { border:1px solid #dee2e6; border-radius:6px; padding:6px 8px; background:#fff; }
+      .line { white-space:pre-wrap; padding:1px 0; }
+      .eq  {}
+      .add { background:#e7f5ff; }
+      .del { background:#fff0f0; }
+      .rep { background:#fff7e6; }
+      .tok-ins { color:#1c7ed6; background:#d0ebff; border-radius:2px; }
+      .tok-del { color:#c92a2a; background:#ffe3e3; border-radius:2px; }
+    </style>
+    """
+
+    a_rows = ["<div class='sec'><div class='box'>"]
+    b_rows = ["<div class='sec'><div class='box'>"]
+
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal":
+            for k in range(i2 - i1):
+                text = esc(a_lines[i1 + k])
+                a_rows.append(f"<div class='line eq'>{text}</div>")
+                b_rows.append(f"<div class='line eq'>{text}</div>")
+        elif tag == "delete":
+            for k in range(i2 - i1):
+                a_line = a_lines[i1 + k]
+                a_rows.append(f"<div class='line del'>{tok_a(a_line, '')}</div>")
+            for _ in range(i2 - i1):
+                b_rows.append("<div class='line del'></div>")
+        elif tag == "insert":
+            for k in range(j2 - j1):
+                b_line = b_lines[j1 + k]
+                b_rows.append(f"<div class='line add'>{tok_b('', b_line)}</div>")
+            for _ in range(j2 - j1):
+                a_rows.append("<div class='line add'></div>")
+        elif tag == "replace":
+            h = max(i2 - i1, j2 - j1)
+            for k in range(h):
+                a_line = a_lines[i1 + k] if (i1 + k) < i2 else ""
+                b_line = b_lines[j1 + k] if (j1 + k) < j2 else ""
+                a_rows.append(f"<div class='line rep'>{tok_a(a_line, b_line) if a_line != '' else ''}</div>")
+                b_rows.append(f"<div class='line rep'>{tok_b(a_line, b_line) if b_line != '' else ''}</div>")
+
+    a_rows.append("</div></div>")
+    b_rows.append("</div></div>")
+
+    return f"<html><head>{css}</head><body>{''.join(a_rows)}{''.join(b_rows)}</body></html>"
+# ===== [/REPLACE] ==============================================================
 
 # ===== 置換ブロック: 縦並びサイド（A 上 / B 下）の差分ダイアログ =====
 class DiffDialog(QDialog):
@@ -3294,10 +3536,31 @@ class AnalyzerWorker(QObject):
                 read_sim_th=self.read_th             # ← 追加
             )
 
+            # ===== 挿入: 文章（文）候補抽出 → ペア生成 =====
+            # 80%: 文章候補抽出
+            self.progress_text.emit("文章候補抽出中…")
+            tokens_sentence = extract_candidates_sentence(
+                pages, min_len=self.min_len, max_len=max(self.max_len, 300),  # 文は少し長めも許容
+                min_count=self.min_count_lex, top_k=0
+            )
+            self._emit(80)
+
+            # 81〜88%: 文章ペア生成
+            df_pairs_sentence = build_synonym_pairs_char_only(
+                tokens_sentence,
+                char_sim_th=self.char_th,
+                top_k=self.top_k_lex,
+                scope="文章",
+                progress_cb=self._subprogress_factory(81, 88, "文章ペア生成"),
+                read_sim_th=self.read_th  # 読みもしきい値で判定（bunsetsu と同様）
+            )
+
+            # ===== 差し替え: 統合（文章を追加） =====
             # 88%: 統合
             self.progress_text.emit("候補統合中…")
-            df_unified = unify_pairs(df_pairs_lex_general, df_pairs_compound, df_pairs_bunsetsu)
+            df_unified = unify_pairs(df_pairs_lex_general, df_pairs_compound, df_pairs_bunsetsu, df_pairs_sentence)
             self._emit(88)
+            # ===== 差し替えここまで =====
 
             # 88.5%: 読み系（lemma/inflect/reading...）を再採点（既存）
             df_unified = recalibrate_reading_like_scores(df_unified, read_th=self.read_th)
@@ -3325,6 +3588,7 @@ class AnalyzerWorker(QObject):
                 df_unified = df_unified[~df_unified["a"].apply(is_single_kana_char)].reset_index(drop=True)
             self._emit(90)
 
+            # ===== 差し替え: 92% トークン一覧整形（sentence を追加） =====
             # 92%: トークン一覧整形
             parts = []
             if len(tokens_fine) > 0:
@@ -3333,10 +3597,15 @@ class AnalyzerWorker(QObject):
                 df_comp = pd.DataFrame(tokens_compound, columns=["token", "count"]); df_comp["type"] = "compound"; parts.append(df_comp)
             if len(tokens_bunsetsu) > 0:
                 df_bun = pd.DataFrame(tokens_bunsetsu, columns=["token", "count"]); df_bun["type"] = "bunsetsu"; parts.append(df_bun)
+            if len(tokens_sentence) > 0:
+                df_sent = pd.DataFrame(tokens_sentence, columns=["token", "count"]); df_sent["type"] = "sentence"; parts.append(df_sent)
+
             df_tokens = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["type", "token", "count"])
             if not df_tokens.empty:
                 df_tokens = df_tokens["type token count".split()].sort_values(["type", "count", "token"], ascending=[True, False, True])
             self._emit(92)
+            # ===== 差し替えここまで =====
+
 
             # 93%: 表示用ラベル変換（2分類）
             df_unified = apply_reason_ja(df_unified)
@@ -3495,12 +3764,18 @@ def extract_pdf_paths_from_urls(urls) -> List[str]:
             out.append(p)
     return sorted(dict.fromkeys(out))
 
+# ===== [REPLACE] DropArea（高さ固定を撤回：固定高さ指定なし） =====
 class DropArea(QTextEdit):
     filesChanged = Signal(list)
     def __init__(self):
         super().__init__(); self.setAcceptDrops(True); self.setReadOnly(True)
         self.setPlaceholderText("ここにPDFをドラッグ＆ドロップしてください（複数可）")
-        self.setStyleSheet("QTextEdit{border:2px dashed #4dabf7; border-radius:10px; background:#fff; padding:10px; color:#111; min-height:80px;}")
+        # 見た目はそのまま／高さは固定しない（必要なら最小高さだけ）
+        self.setStyleSheet(
+            "QTextEdit{border:2px dashed #4dabf7; border-radius:10px; "
+            "background:#fff; padding:10px; color:#111; min-height:100px;}"
+        )
+
     def dragEnterEvent(self, e):
         e.acceptProposedAction() if e.mimeData().hasUrls() else e.ignore()
     def dragMoveEvent(self, e):
@@ -3510,8 +3785,10 @@ class DropArea(QTextEdit):
             e.ignore(); return
         files = extract_pdf_paths_from_urls(e.mimeData().urls())
         if files:
-            self.setText("\n".join(files)); self.filesChanged.emit(files)
+            self.setText("\n".join(files))
+            self.filesChanged.emit(files)
         e.acceptProposedAction()
+# ===== [/REPLACE] =====================================================
 
 # =========================================================
 # MainWindow（まるごと差し替え）
@@ -3519,7 +3796,7 @@ class DropArea(QTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.40]")
+        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.50]")
         self.resize(1180, 860)
 
         # ---- レイアウト骨格 ----
@@ -3539,6 +3816,10 @@ class MainWindow(QMainWindow):
         # 入力PDF
         gb_files = QGroupBox("入力PDF")
         v_files = QVBoxLayout(gb_files)
+        # ===== [PATCH] 入力PDFレイアウトの下余白を小さく =====
+        v_files.setContentsMargins(8, 8, 8, 4)  # 左,上,右,下
+        v_files.setSpacing(6)
+        # ===== [/PATCH] =================================
         self.drop = DropArea()
         v_files.addWidget(self.drop)
         row = QHBoxLayout()
@@ -3547,8 +3828,24 @@ class MainWindow(QMainWindow):
         row.addWidget(self.btn_browse)
         row.addWidget(self.btn_clear)
         v_files.addLayout(row)
+        # ===== [PATCH] ファイル一覧リストを “3行表示” に固定して縦幅を狭く =====
         self.list_files = QListWidget()
+        self.list_files.setAlternatingRowColors(True)
+        self.list_files.setUniformItemSizes(True)  # 行高の計算を安定化
+        self.list_files.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # 3行ぶんの高さに抑える（フォントに応じて自動計算）
+        visible_rows = 3
+        fm = self.list_files.fontMetrics()
+        row_h = max(18, fm.height() + 6)  # 行の目安（字高 + パディング）
+        frame = self.list_files.frameWidth() * 2
+        # 上下の余白を少なめに見積もって調整
+        self.list_files.setFixedHeight(visible_rows * row_h + frame + 2)
+
+        # 件数ラベルも余白を詰めてコンパクトに
         self.lbl_count = QLabel("選択ファイル：0 件")
+        self.lbl_count.setStyleSheet("color:#666; margin-top:2px;")
+        # ===== [/PATCH] =======================================================
         v_files.addWidget(self.list_files)
         v_files.addWidget(self.lbl_count)
 
@@ -3577,6 +3874,48 @@ class MainWindow(QMainWindow):
 
         left.addWidget(gb_files)
         left.addWidget(gb_params)
+        # ===== [PATCH] 差分プレビュー領域を少し狭く（高さ/余白/パディング） =====
+        gb_diff = QGroupBox("簡易差分")
+        v_diff = QVBoxLayout(gb_diff)
+        # 余白と間隔を詰める（下方向をやや強め）
+        v_diff.setContentsMargins(8, 4, 8, 6)  # L, T, R, B
+        v_diff.setSpacing(4)
+
+        self.diff_view = QTextBrowser()
+        self.diff_view.setOpenExternalLinks(False)
+        self.diff_view.setReadOnly(True)
+
+        # パディングを小さく・枠は維持、背景は白
+        self.diff_view.setStyleSheet(
+            "QTextBrowser{background:#fff; border:0px solid #dee2e6; "
+            "border-radius:6px; padding:10px 6px;}"  # ← 6px/8px → 4px/6px に縮小
+        )
+
+        # 高さは“上限”を付けてコンパクトに（必要なら数値を微調整）
+        self.diff_view.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.diff_view.setMaximumHeight(120)  # ← 140〜180でお好み調整
+
+        # スクロールバーは必要時のみ表示（高さ上限内でスクロール）
+        self.diff_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.diff_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        # 初期メッセージ（そのまま or 省略済み）
+        self.diff_view.setHtml(
+            "<html><body style='font-family:Yu Gothic UI, Noto Sans JP, sans-serif; "
+            "color:#666; font-size:12px; margin:4px 6px;'>"
+            "表のセルを選択すると、簡易差分をここに表示します。"
+            "</body></html>"
+        )
+
+        v_diff.addWidget(self.diff_view)
+
+        # GroupBox 自体も“高さを取りすぎない”ように最大方針
+        gb_diff.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+
+        # 追加位置は従来どおり
+        left.addWidget(gb_diff)
+        # ===== [/PATCH] ======================================================
+
         left.addStretch(1)
         left.addWidget(self.btn_run)
         left.addWidget(self.progress)
@@ -3623,7 +3962,7 @@ class MainWindow(QMainWindow):
         # 2) 対象（語彙/複合語/文節）
         row_scope = QHBoxLayout(); row_scope.setSpacing(8)
         row_scope.addWidget(QLabel("対　　象:"))
-        self.scope_labels = ["語彙", "複合語", "文節"]
+        self.scope_labels = ["名詞", "活用語", "複合語", "文節", "文章"]
         self.chk_scopes: Dict[str, QCheckBox] = {}
         for s in self.scope_labels:
             cb = QCheckBox(s); cb.setChecked(True); self.chk_scopes[s] = cb
@@ -3747,6 +4086,9 @@ class MainWindow(QMainWindow):
         self.proxy_tokens.setFilterKeyColumn(1)  # tokens: 0:type, 1:token, 2:count
 
         self.view_unified.setModel(self.proxy_unified)
+        # ===== [PATCH] 選択変更で差分プレビュー更新 =====
+        self.view_unified.selectionModel().selectionChanged.connect(self.on_unified_selection_changed)
+        # ===== [/PATCH] =================================
         self.view_tokens.setModel(self.proxy_tokens)
 
         # ---- Signals ----
@@ -4565,6 +4907,65 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "完了", "PDFへマーキングしました。")
         except Exception as e:
             QMessageBox.critical(self, "エラー", str(e))
+
+    # ===== [NEW] プレビュー更新: 選択インデックスから a/b を拾って差分を描画 =====
+    def _show_inline_diff_for_index(self, proxy_index: QModelIndex):
+        try:
+            if not proxy_index or not proxy_index.isValid():
+                return
+            # Proxy -> Source にマップ
+            src_index = self.proxy_unified.mapToSource(proxy_index)
+            row = src_index.row()
+
+            # UnifiedModel 側の DataFrame から a/b を取得
+            df = self.model_unified._df  # 既存実装に倣い内部DFへアクセス
+            if df is None or df.empty:
+                return
+            if "a" not in df.columns or "b" not in df.columns:
+                return
+
+            a_txt = "" if pd.isna(df.at[row, "a"]) else str(df.at[row, "a"])
+            b_txt = "" if pd.isna(df.at[row, "b"]) else str(df.at[row, "b"])
+
+            html = build_vertical_diff_html_embed(a_txt, b_txt)
+            self.diff_view.setHtml(html)
+        except Exception:
+            pass
+
+    # ===== 差し替え: 左プレビューを統合インライン差分に切り替え =====
+    def on_unified_selection_changed(self, selected, deselected):
+        try:
+            sel = self.view_unified.selectionModel().selectedRows()
+        except Exception:
+            sel = []
+        if not sel:
+            # 何も選択されていないときのプレースホルダ
+            self.diff_view.setHtml(
+                "<html><body style='font-family:Yu Gothic UI, Noto Sans JP, sans-serif;"
+                "color:#666; font-size:12px; margin:4px 6px;'>"
+                "表のセルを選択すると、<b>統合インライン差分</b>をここに表示します。"
+                "</body></html>"
+            )
+            return
+
+        proxy_index = sel[0]
+        src_index = self.proxy_unified.mapToSource(proxy_index)
+        row = src_index.row()
+
+        df = getattr(self.model_unified, "_df", pd.DataFrame())
+        if df.empty or row < 0 or row >= len(df):
+            return
+
+        a = df.at[row, "a"] if "a" in df.columns else ""
+        b = df.at[row, "b"] if "b" in df.columns else ""
+
+        html = build_unified_inline_diff_embed(
+            "" if a is None else str(a),
+            "" if b is None else str(b)
+        )
+        self.diff_view.setHtml(html)
+    # ===== 差し替えここまで =====
+
 
 def main():
     app = QApplication(sys.argv)
