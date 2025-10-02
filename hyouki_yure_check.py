@@ -3513,9 +3513,18 @@ class AnalyzerWorker(QObject):
                     # NFKC + lower を事前にかけ、空や完全一致は内包から除外
                     sa = df_unified["a"].astype("string").map(lambda x: nfkc(x or "").lower())
                     sb = df_unified["b"].astype("string").map(lambda x: nfkc(x or "").lower())
-                    df_unified["__contains__"] = (sa != sb) & (
-                        sa.str.contains(sb, regex=False) | sb.str.contains(sa, regex=False)
-                    )
+
+                    # ★ ここを “行ごと” の評価に置き換える（Series 同士の .str.contains は不可）
+                    def _contains_pair(a: str, b: str) -> bool:
+                        if not a or not b:
+                            return False
+                        if a == b:
+                            return False
+                        return (a.find(b) != -1) or (b.find(a) != -1)
+
+                    df_unified["__contains__"] = [
+                        _contains_pair(aa, bb) for aa, bb in zip(sa.tolist(), sb.tolist())
+                    ]
                 else:
                     # 列が足りない場合は False で埋めておく
                     if df_unified is not None and not df_unified.empty:
@@ -3524,6 +3533,7 @@ class AnalyzerWorker(QObject):
                 # 何かあれば安全側に倒す（フォールバック計算に任せる）
                 if df_unified is not None and not df_unified.empty:
                     df_unified["__contains__"] = False
+
 
 
             # 94%: 字数を Worker 側で付与（UIの仕事を減らす）
