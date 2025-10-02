@@ -3814,7 +3814,7 @@ class DropArea(QTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.50]")
+        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.51]")
         self.resize(1180, 860)
 
         # ---- レイアウト骨格 ----
@@ -4693,58 +4693,68 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "エラー", str(e))
 
     def on_mark_pdf(self):
-        """表示中テーブルのチェック済み a/b を PDF にマーキング（既存ロジック準拠）"""
+        """チェック済みの行に行番号(1,2,...)を振り、行内の a/b に 1-a, 1-b ... の注釈を付ける"""
+        import os
+        import unicodedata
+        import pandas as pd
+        import fitz  # PyMuPDF
+
+        # 入力チェック
         if not self.files:
             QMessageBox.warning(self, "注意", "PDFを指定してください。")
             return
+
         df = getattr(self.model_unified, "_df", pd.DataFrame())
         if df.empty:
             QMessageBox.information(self, "情報", "マーキング対象がありません。")
             return
 
-        # 選択抽出
+        # カラム位置
         col_a = df.columns.get_indexer(["a"])[0] if "a" in df.columns else -1
         col_b = df.columns.get_indexer(["b"])[0] if "b" in df.columns else -1
-        raw_targets = []
+
+        # ===== 1) チェック済み行を a/b のペアとして束ね、行順で通し番号を振る土台を作成 =====
+        # rows: [ [("a", a_text?), ("b", b_text?)] , ... ]  ※aまたはbが欠ける場合もあり
+        rows = []
         for r_proxy in range(self.proxy_unified.rowCount()):
             src_idx = self.proxy_unified.mapToSource(self.proxy_unified.index(r_proxy, 0))
             i = src_idx.row()
             if i < 0 or i >= len(self.model_unified._checks):
                 continue
-            if self.model_unified._checks[i]:
-                if col_a >= 0:
-                    a = df.iat[i, col_a]
-                    if isinstance(a, str) and a:
-                        raw_targets.append(("a", a))
-                if col_b >= 0:
-                    b = df.iat[i, col_b]
-                    if isinstance(b, str) and b:
-                        raw_targets.append(("b", b))
-        if not raw_targets:
+            if not self.model_unified._checks[i]:
+                continue
+
+            pair = []
+            if col_a >= 0:
+                a = df.iat[i, col_a]
+                if isinstance(a, str) and a:
+                    pair.append(("a", a))
+            if col_b >= 0:
+                b = df.iat[i, col_b]
+                if isinstance(b, str) and b:
+                    pair.append(("b", b))
+
+            if pair:
+                # 念のため a→b の順を保証
+                pair.sort(key=lambda t: t[0])
+                rows.append(pair)
+
+        if not rows:
             QMessageBox.information(self, "情報", "マーキング対象が選択されていません。")
             return
 
-        # 重複整理（a優先）
-        by_text = {}
-        for kind, text in raw_targets:
-            if text not in by_text:
-                by_text[text] = kind
-            else:
-                if by_text[text] == "b" and kind == "a":
-                    by_text[text] = "a"
-        items = [(kind, text) for text, kind in by_text.items()]
-        items.sort(key=lambda kt: (kt[0], kt[1]))
-
-        COLOR_YELLOW = (0.98, 0.90, 0.25)
-        COLOR_CYAN   = (0.00, 0.90, 1.00)
+        # ===== 2) 色設定（従来踏襲） =====
+        COLOR_YELLOW = (0.98, 0.90, 0.25)  # a
+        COLOR_CYAN   = (0.00, 0.90, 1.00)  # b
         HIGHLIGHT_COLORS = {"a": COLOR_YELLOW, "b": COLOR_CYAN}
 
+        # 出力フォルダ
         out_dir = QFileDialog.getExistingDirectory(self, "出力フォルダを選択")
         if not out_dir:
             return
 
-        # 検索の堅牢化（元実装を簡約移植）
-        CONN_CHARS = "ー-－–—・/／_＿"
+        # ===== 3) 検索ユーティリティ（元実装の堅牢検索をそのまま使用） =====
+        CONN_CHARS = "ー\\-－–—・/／\\_＿"
         SPACE_CHARS = {" ", "\u00A0", "\u3000"}
 
         def nfkc(s: str) -> str:
@@ -4757,15 +4767,19 @@ class MainWindow(QMainWindow):
                 out.append(chr(o + 0x60) if 0x3041 <= o <= 0x3096 else ch)
             return "".join(out)
 
-        def kana_norm_variants(s: str) -> Set[str]:
+        def kana_norm_variants(s: str):
             base = nfkc(s or ""); k = hira_to_kata(base)
             return {k, k.replace("ー", "")}
 
-        def base_variants(s: str) -> Set[str]:
+        def base_variants(s: str):
             vs = set(); s0 = s or ""; s1 = nfkc(s0)
             for cand in (s0, s1):
-                if not cand: continue
-                vs.add(cand); vs.add(cand.replace(" ", "")); vs.add(cand.replace(" ", "\u00A0")); vs.add(cand.replace(" ", "\u3000"))
+                if not cand:
+                    continue
+                vs.add(cand)
+                vs.add(cand.replace(" ", ""))
+                vs.add(cand.replace(" ", "\u00A0"))
+                vs.add(cand.replace(" ", "\u3000"))
                 for ch in list(CONN_CHARS):
                     if ch in cand:
                         vs.add(cand.replace(ch, ""))
@@ -4789,15 +4803,18 @@ class MainWindow(QMainWindow):
                         if "chars" in span and isinstance(span["chars"], list) and span["chars"]:
                             for ch in span["chars"]:
                                 c = ch.get("c", ""); bbox = ch.get("bbox", None)
-                                if not c or not bbox: continue
+                                if not c or not bbox:
+                                    continue
                                 r = fitz.Rect(bbox)
                                 chars.append({"orig": c, "rect": r, "line": line_counter})
                         else:
                             text = span.get("text", ""); bbox = span.get("bbox", None)
-                            if not text or not bbox: continue
+                            if not text or not bbox:
+                                continue
                             used_equal_split = True
                             r = fitz.Rect(bbox); n = len(text)
-                            if n <= 0: continue
+                            if n <= 0:
+                                continue
                             x0, y0, x1, y1 = r
                             dx, dy = 1.0, 0.0
                             d = span.get("dir", None)
@@ -4818,41 +4835,53 @@ class MainWindow(QMainWindow):
                                     rr = fitz.Rect(x0 + idx*ch_w, y0, x0 + (idx+1)*ch_w, y1)
                                     chars.append({"orig": c, "rect": rr, "line": line_counter})
                     line_counter += 1
+
             def norm_keep(c: str) -> str:
-                if c in SPACE_CHARS or c in CONN_CHARS: return ""
+                if c in SPACE_CHARS or c in CONN_CHARS:
+                    return ""
                 c = hira_to_kata(nfkc(c))
-                if c in SPACE_CHARS or c in CONN_CHARS: return ""
+                if c in SPACE_CHARS or c in CONN_CHARS:
+                    return ""
                 return c
+
             def norm_nochoon(c: str) -> str:
                 s = norm_keep(c)
-                if s == "ー": return ""
+                if s == "ー":
+                    return ""
                 return s
+
             keep_list, keep_idxmap = [], []
             noch_list, noch_idxmap = [], []
             for i, it in enumerate(chars):
                 c = it["orig"]
                 nk = norm_keep(c)
-                if nk: keep_list.append(nk); keep_idxmap.append(i)
+                if nk:
+                    keep_list.append(nk); keep_idxmap.append(i)
                 nn = norm_nochoon(c)
-                if nn: noch_list.append(nn); noch_idxmap.append(i)
+                if nn:
+                    noch_list.append(nn); noch_idxmap.append(i)
             stream_keep = "".join(keep_list)
             stream_noch = "".join(noch_list)
             return chars, (stream_keep, keep_idxmap), (stream_noch, noch_idxmap), used_equal_split
 
         def search_stream(stream_text: str, idxmap: list, qnorm: str):
             pos = 0; spans = []; Lq = len(qnorm)
-            if not qnorm or not stream_text: return spans
+            if not qnorm or not stream_text:
+                return spans
             while True:
                 k = stream_text.find(qnorm, pos)
-                if k < 0: break
+                if k < 0:
+                    break
                 s_idx = k; e_idx = k + Lq - 1
                 spans.append((idxmap[s_idx], idxmap[e_idx]))
                 pos = k + 1
             return spans
 
         def merge_to_line_rects(chars, idx_s: int, idx_e: int):
+            from collections import defaultdict
             items = chars[idx_s:idx_e+1]
-            if not items: return []
+            if not items:
+                return []
             by_line = defaultdict(list)
             for it in items:
                 by_line[it["line"]].append(it["rect"])
@@ -4879,9 +4908,12 @@ class MainWindow(QMainWindow):
                 for v in base_variants(q):
                     v_keep = hira_to_kata(nfkc(v))
                     v_keep = "".join(ch for ch in v_keep if ch not in SPACE_CHARS and ch not in CONN_CHARS)
-                    if v_keep: qnorm_keep_set.add(v_keep)
+                    if v_keep:
+                        qnorm_keep_set.add(v_keep)
                     v_noch = v_keep.replace("ー", "")
-                    if v_noch: qnorm_noch_set.add(v_noch)
+                    if v_noch:
+                        qnorm_noch_set.add(v_noch)
+
             stream_hits = []
             for qk in qnorm_keep_set:
                 for s_idx, e_idx in search_stream(stream_keep, keep_idxmap, qk):
@@ -4917,9 +4949,11 @@ class MainWindow(QMainWindow):
                 drop = False
                 for rk in kept:
                     inter_a = inter(r, rk)
-                    if inter_a <= 0: continue
+                    if inter_a <= 0: 
+                        continue
                     iou = inter_a / (area(r) + area(rk) - inter_a + 1e-6)
-                    if iou >= iou_th: drop = True; break
+                    if iou >= iou_th:
+                        drop = True; break
                     if (r.x0 >= rk.x0 - 0.5 and r.y0 >= rk.y0 - 0.5 and
                         r.x1 <= rk.x1 + 0.5 and r.y1 <= rk.y1 + 0.5):
                         drop = True; break
@@ -4927,30 +4961,44 @@ class MainWindow(QMainWindow):
                     kept.append(r)
             return kept
 
+        # ===== 4) PDF へマーキング（行番号は rows の並び順で 1,2,3,... 固定） =====
         try:
             for src in self.files:
-                doc = fitz.open(src)
-                for page in doc:
-                    page_rects = []
-                    for v_idx, (kind, s) in enumerate(items):
-                        label = chr(ord('a') + (v_idx % 26))
-                        gid = self.surf2gid.get(s, 0)
-                        rects = robust_find_on_page(page, [s])
-                        rects = suppress_overlap_hits(rects)
-                        for r in rects:
-                            page_rects.append((r, s, gid, label, kind))
-                    for r, text, gid, var, kind in page_rects:
-                        ann = page.add_highlight_annot(r)
-                        ann.set_info({"title": f"{gid}-{var}", "subject": f"#{gid}", "content": text})
-                        color = HIGHLIGHT_COLORS.get(kind, COLOR_YELLOW)
-                        ann.set_colors(stroke=color)
-                        ann.update()
-                base = os.path.splitext(os.path.basename(src))[0]
-                out_path = os.path.join(out_dir, f"{base}_marked.pdf")
-                doc.save(out_path); doc.close()
+                doc = None
+                try:
+                    doc = fitz.open(src)
+                    for page in doc:
+                        page_rects = []
+                        # row_no はページ/ファイルをまたいでも同じ行に対して一定
+                        for row_no, pair in enumerate(rows, start=1):
+                            for kind, s in pair:
+                                rects = robust_find_on_page(page, [s])
+                                rects = suppress_overlap_hits(rects)
+                                for r in rects:
+                                    page_rects.append((r, s, row_no, kind))
+
+                        # アノテーション反映（title: "行-種別", subject: "#行"）
+                        for r, text, row_no, kind in page_rects:
+                            ann = page.add_highlight_annot(r)
+                            ann.set_info({
+                                "title":   f"{row_no}-{kind}",
+                                "subject": f"#{row_no}",
+                                "content": text
+                            })
+                            color = HIGHLIGHT_COLORS.get(kind, COLOR_YELLOW)
+                            ann.set_colors(stroke=color)
+                            ann.update()
+
+                    base = os.path.splitext(os.path.basename(src))[0]
+                    out_path = os.path.join(out_dir, f"{base}_marked.pdf")
+                    doc.save(out_path)
+                finally:
+                    if doc is not None:
+                        doc.close()
             QMessageBox.information(self, "完了", "PDFへマーキングしました。")
         except Exception as e:
             QMessageBox.critical(self, "エラー", str(e))
+
 
     # ===== [NEW] プレビュー更新: 選択インデックスから a/b を拾って差分を描画 =====
     def _show_inline_diff_for_index(self, proxy_index: QModelIndex):
