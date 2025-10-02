@@ -28,14 +28,11 @@ from PySide6.QtWidgets import (
 )
 # ===== [/PATCH] ======================
 
-from PySide6.QtWidgets import QHeaderView
 # 先頭の import 群のどこかに追加
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 
 # === 帯付き Levenshtein & しきい値付き類似度判定（新規追加） ===
-from typing import Optional
-
 def levenshtein_band(a: str, b: str, k: int) -> Optional[int]:
     """
     帯幅 k の制限付き Levenshtein 距離。
@@ -2104,31 +2101,6 @@ def build_synonym_pairs_general(
     )
 # ===== [/REPLACE] ==============================================================
 
-# ===== [6-A] 2-gram 逆引きインデックス（追加） ==========================
-from collections import defaultdict
-
-def _build_bigram_inverted_index(ngram_list):
-    """ngram_list: List[frozenset[str]] を受け取り、2-gram -> [idx,...] の dict を返す"""
-    inv = defaultdict(list)
-    for idx, grams in enumerate(ngram_list):
-        for g in grams:
-            inv[g].append(idx)
-    # 必要なら重複排除（速度とメモリのバランスで適宜）
-    for g, lst in inv.items():
-        inv[g] = sorted(set(lst))
-    return inv
-
-def _candidate_ids_via_index(i: int, inv: dict, ngram_list, n: int):
-    """
-    文脈 i の候補 j を逆引きインデックスで取得（i < j のみ）。
-    """
-    Ai = ngram_list[i]
-    pool = set()
-    for g in Ai:
-        pool.update(inv.get(g, ()))
-    return [j for j in pool if j > i and j < n]
-# =======================================================================
-
 # ===== 並列版 build_synonym_pairs_char_only（関数ごと差し替え） =====
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
@@ -2582,123 +2554,6 @@ def build_unified_inline_diff_embed(a: str, b: str) -> str:
     """
     return f"<html><head>{css}</head><body><div class='box'>{body}</div></body></html>"
 
-
-def html_quick_ab_diff(a: str, b: str) -> str:
-    import difflib
-    def token_diff_for_A(a_line: str, b_line: str) -> str:
-        sm2 = difflib.SequenceMatcher(a=a_line or "", b=b_line or "")
-        parts = []
-        for op, i1, i2, j1, j2 in sm2.get_opcodes():
-            a_seg = (a_line or "")[i1:i2]
-            b_seg = (b_line or "")[j1:j2]
-            if op == "equal":
-                parts.append(_esc_html(a_seg))
-            elif op in ("delete", "replace"):
-                if a_seg:
-                    parts.append(f"<span class='tok-del'>{_esc_html(a_seg)}</span>")
-        return "".join(parts)
-
-    def token_diff_for_B(a_line: str, b_line: str) -> str:
-        sm2 = difflib.SequenceMatcher(a=a_line or "", b=b_line or "")
-        parts = []
-        for op, i1, i2, j1, j2 in sm2.get_opcodes():
-            a_seg = (a_line or "")[i1:i2]
-            b_seg = (b_line or "")[j1:j2]
-            if op == "equal":
-                parts.append(_esc_html(b_seg))
-            elif op in ("insert", "replace"):
-                if b_seg:
-                    parts.append(f"<span class='tok-ins'>{_esc_html(b_seg)}</span>")
-        return "".join(parts)
-
-    a = "" if a is None else str(a)
-    b = "" if b is None else str(b)
-    sm = difflib.SequenceMatcher(a=a.splitlines(), b=b.splitlines())
-    ops = sm.get_opcodes()
-
-    css = """
-    <style>
-    html, body, div, p { margin:0; padding:0; }
-    body {
-      font-family:'Yu Gothic UI','Noto Sans JP',sans-serif;
-      color:#111; font-size:16px; line-height:1.80; letter-spacing:0.2px;
-    }
-    .page { padding-top:6px; padding-bottom:0; }
-    .sec { margin:0 0 6px 0; }
-    .sec:last-child { margin-bottom:0; }
-    .sec-b { margin-top:12px; }
-    .sec-head { font-weight:600; margin:0; line-height:0; }
-    .sec-a .sec-head { color:#d9480f; }
-    .sec-b .sec-head { color:#1c7ed6; }
-    .diff { line-height:1.00; }
-    table, .wrap { border-collapse:collapse; border-spacing:0; margin:0; }
-    .wrap { width:100%; }
-    .rail { width:18px; }
-    .rail-a { background:#fa5252; }
-    .rail-b { background:#4dabf7; }
-    .body { padding:4px 10px 6px 10px; }
-    .line { white-space:pre-wrap; padding:2px 4px; }
-    .eq {}
-    .add { background:#e7f5ff; }
-    .del { background:#fff0f0; }
-    .rep { background:#fff7e6; }
-    .tok-ins { color:#1c7ed6; background:#d0ebff; border-radius:2px; }
-    .tok-del { color:#c92a2a; background:#ffe3e3; border-radius:2px; }
-    </style>
-    """
-
-    def esc(s: str) -> str:
-        return _esc_html(s or "")
-
-    a_lines = a.splitlines()
-    b_lines = b.splitlines()
-
-    a_rows = [
-        "<div class='page sec sec-a'>",
-        "<div class='diff'>",
-        "<table class='wrap' cellspacing='0' cellpadding='0'><tr>",
-        "<td class='rail rail-a'></td>",
-        "<td class='body'>"
-    ]
-    b_rows = [
-        "<div class='page sec sec-b'>",
-        "<div class='diff'>",
-        "<table class='wrap' cellspacing='0' cellpadding='0'><tr>",
-        "<td class='rail rail-b'></td>",
-        "<td class='body'>"
-    ]
-
-    for tag, i1, i2, j1, j2 in ops:
-        if tag == "equal":
-            for k in range(i2 - i1):
-                text = esc(a_lines[i1 + k])
-                a_rows.append(f"<div class='line eq'>{text}</div>")
-                b_rows.append(f"<div class='line eq'>{text}</div>")
-        elif tag == "delete":
-            for k in range(i2 - i1):
-                a_line = a_lines[i1 + k]
-                a_rows.append(f"<div class='line del'>{token_diff_for_A(a_line, '')}</div>")
-            for _ in range(i2 - i1):
-                b_rows.append("<div class='line del'></div>")
-        elif tag == "insert":
-            for k in range(j2 - j1):
-                b_line = b_lines[j1 + k]
-                b_rows.append(f"<div class='line add'>{token_diff_for_B('', b_line)}</div>")
-            for _ in range(j2 - j1):
-                a_rows.append("<div class='line add'></div>")
-        elif tag == "replace":
-            h = max(i2 - i1, j2 - j1)
-            for k in range(h):
-                a_line = a_lines[i1 + k] if (i1 + k) < i2 else ""
-                b_line = b_lines[j1 + k] if (j1 + k) < j2 else ""
-                a_rows.append(f"<div class='line rep'>{token_diff_for_A(a_line, b_line) if a_line != '' else ''}</div>")
-                b_rows.append(f"<div class='line rep'>{token_diff_for_B(a_line, b_line) if b_line != '' else ''}</div>")
-
-    a_rows += ["</td></tr></table>", "</div>", "</div>"]
-    b_rows += ["</td></tr></table>", "</div>", "</div>"]
-
-    html = f"<html><head>{css}</head><body>{''.join(a_rows)}{''.join(b_rows)}</body></html>"
-    return html
 
 # ===== [REPLACE] 差分プレビュー用：縦並び（見出しなし・A/B表記なし） =====
 def build_vertical_diff_html_embed(a: str, b: str) -> str:
@@ -3281,10 +3136,12 @@ class UnifiedFilterProxy(QSortFilterProxyModel):
             h = m.headerData(c, Qt.Horizontal, Qt.DisplayRole)
             if isinstance(h, str):
                 name = h.strip()
-                # ▼ “字数” もキャッシュ対象に追加
+                # ▼ “字数” ほかに __contains__ を追加
                 if name in {
-                    "a", "b", "一致要因", "理由", "reason", "対象", "scope", "target",
-                    "端差", "数字以外一致", "字数"
+                    "a", "b", "一致要因", "理由", "reason",
+                    "対象", "scope", "target",
+                    "端差", "数字以外一致", "字数",
+                    "__contains__",   # ← これを追加
                 }:
                     self._cols[name] = c
 
@@ -3387,18 +3244,31 @@ class UnifiedFilterProxy(QSortFilterProxyModel):
             if a_len is not None and a_len <= self._hide_short_len:
                 return False
 
-        # 4.7) ▼ 新規：内包関係除外（a ∈ b もしくは b ∈ a）
+        # 4.7) ▼ 内包関係除外（a ∈ b もしくは b ∈ a）
         if self._hide_contains:
-            ca, cb = self._col("a"), self._col("b")
-            if ca >= 0 and cb >= 0:
-                a_txt = m.data(m.index(row, ca, parent), Qt.DisplayRole) or ""
-                b_txt = m.data(m.index(row, cb, parent), Qt.DisplayRole) or ""
-                # NFKC正規化 + 小文字化で安定判定（全角/半角・ケース差を吸収）
-                sa = nfkc(str(a_txt)).lower()
-                sb = nfkc(str(b_txt)).lower()
-                # 完全一致は“内包”から除外（== は隠さない）
-                if sa and sb and sa != sb and (sa.find(sb) != -1 or sb.find(sa) != -1):
+            # まずは前計算列があればそれを使う（高速）
+            c_flag = self._col("__contains__")
+            if c_flag >= 0:
+                v = m.data(m.index(row, c_flag, parent), Qt.DisplayRole)
+                # pandasのbool/NaN/文字列True/Falseを素朴に判定
+                sv = ("" if v is None else str(v)).strip().lower()
+                if sv in ("true", "1"):
                     return False
+            else:
+                # フォールバック：従来の“その場計算”（列が無い場合のみ実行）
+                ca, cb = self._col("a"), self._col("b")
+                if ca >= 0 and cb >= 0:
+                    a_txt = m.data(m.index(row, ca, parent), Qt.DisplayRole) or ""
+                    b_txt = m.data(m.index(row, cb, parent), Qt.DisplayRole) or ""
+                    try:
+                        sa = nfkc(str(a_txt)).lower()
+                        sb = nfkc(str(b_txt)).lower()
+                        # 完全一致は内包扱いにしない
+                        if sa and sb and sa != sb and (sa.find(sb) != -1 or sb.find(sa) != -1):
+                            return False
+                    except Exception:
+                        pass
+
 
         # 5) 一致要因
         if self._reasons:
@@ -3636,6 +3506,26 @@ class AnalyzerWorker(QObject):
             except Exception:
                 pass
 
+            # 93.6%: 内包関係フラグ（a ∈ b または b ∈ a）を前計算して列化
+            # 目的：プロキシ側での毎行NFKC/比較を避け、ビュー操作を軽くする
+            try:
+                if df_unified is not None and not df_unified.empty and {"a", "b"}.issubset(df_unified.columns):
+                    # NFKC + lower を事前にかけ、空や完全一致は内包から除外
+                    sa = df_unified["a"].astype("string").map(lambda x: nfkc(x or "").lower())
+                    sb = df_unified["b"].astype("string").map(lambda x: nfkc(x or "").lower())
+                    df_unified["__contains__"] = (sa != sb) & (
+                        sa.str.contains(sb, regex=False) | sb.str.contains(sa, regex=False)
+                    )
+                else:
+                    # 列が足りない場合は False で埋めておく
+                    if df_unified is not None and not df_unified.empty:
+                        df_unified["__contains__"] = False
+            except Exception:
+                # 何かあれば安全側に倒す（フォールバック計算に任せる）
+                if df_unified is not None and not df_unified.empty:
+                    df_unified["__contains__"] = False
+
+
             # 94%: 字数を Worker 側で付与（UIの仕事を減らす）
             if not df_unified.empty and "a" in df_unified.columns:
                 try:
@@ -3815,7 +3705,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PDF 表記ゆれチェック [ver.1.51]")
-        self.resize(1180, 860)
+        self.resize(1000, 700)
 
         # ---- レイアウト骨格 ----
         central = QWidget()
@@ -4247,7 +4137,7 @@ class MainWindow(QMainWindow):
         model = view.model()  # proxy
         if not model:
             return
-        names_hide = {"端差", "数字以外一致"}  # 必要に応じて追加
+        names_hide = {"端差", "数字以外一致", "__contains__"}  # 必要に応じて追加
         hdr = view.horizontalHeader()
         for c in range(model.columnCount()):
             name = (model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "").strip()
@@ -4255,38 +4145,69 @@ class MainWindow(QMainWindow):
                 hdr.setSectionResizeMode(c, QHeaderView.Fixed)
                 view.setColumnHidden(c, True)
 
-    # ===== [REPLACE] MainWindow._compact_columns（非 a/b 列を Fixed + 上限幅） =====
+    # ===== [REPLACE] MainWindow._compact_columns（gid基準の同幅＋一致要因だけStretch） =====
     def _compact_columns(self):
         view = self.view_unified
         model = view.model()
         if not model:
             return
+
         hdr = view.horizontalHeader()
         hdr.setMinimumSectionSize(40)
 
-        NUMERIC = {"gid", "字数", "a_count", "b_count", "a数", "b数", "score", "類似度"}
-        LABELS  = {"一致要因", "理由", "対象", "scope", "target"}
+        # 表示ヘッダ名から列番号を探すヘルパ
+        def col_by_name(*names: str) -> int:
+            for c in range(model.columnCount()):
+                name = (model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "").strip()
+                if name in names:
+                    return c
+            return -1
 
-        # 列名→インデックスを走査
+        # 2) 「a数」「b数」「類似度」「対象」を gid と同幅の Fixed にする
+        for label in ("gid", "字数", "a数", "b数", "類似度", "対象"):
+            c = col_by_name(label)
+            if c >= 0:
+                hdr.setSectionResizeMode(c, QHeaderView.Fixed)
+                view.setColumnWidth(c, 72)
+
+        # 3) 「一致要因」だけは Stretch（ウィンドウに合わせて伸縮）
+        c_reason = col_by_name("一致要因")
+        if c_reason >= 0:
+            hdr.setSectionResizeMode(c_reason, QHeaderView.Stretch)
+            # ★ヘッダの“全列共通”最小幅は設定しない！
+            # 初期表示が狭すぎる場合だけ、起動直後に少し広げる
+            view.setColumnWidth(c_reason, max(view.columnWidth(c_reason), 200))
+
+
+        # 4) それ以外の列
+        #    - a/b はユーザー操作しやすい Interactive
+        #    - 残りは Fixed + 上限幅キャップでコンパクトに
+        NUMERIC = {"字数"}  # （a数/b数/類似度 はすでに gid 同幅にしているので除外）
+        LABELS  = {"理由", "scope", "target"}  # 「一致要因」「対象」は既に処理済み
+
         for c in range(model.columnCount()):
             name = (model.headerData(c, Qt.Horizontal, Qt.DisplayRole) or "").strip()
+
+            # 既に個別ルールを与えた列はスキップ
+            if name in {"gid", "a数", "b数", "類似度", "対象", "一致要因"}:
+                continue
+
             if name in {"a", "b"}:
-                # a/b はユーザー操作しやすいよう Interactive（幅は別関数で上限クリップ）
                 hdr.setSectionResizeMode(c, QHeaderView.Interactive)
                 continue
 
-            # a/b 以外は Fixed + 上限幅で抑制
+            # その他は Fixed + 上限で抑える
             if name in NUMERIC:
-                max_w = 88 if name not in {"gid", "字数"} else 72
+                max_w = 72
             elif name in LABELS:
                 max_w = 120
             else:
-                max_w = 140  # その他は 140px 上限
+                max_w = 140
 
-            # 現在幅と上限を比較してセット
             cur = view.columnWidth(c)
             view.setColumnWidth(c, min(max_w, cur if cur > 0 else max_w))
             hdr.setSectionResizeMode(c, QHeaderView.Fixed)
+    # ===== [/REPLACE] =========================================================
 
     # =========================================================
     # DnD & 入出力
@@ -4980,9 +4901,10 @@ class MainWindow(QMainWindow):
                         # アノテーション反映（title: "行-種別", subject: "#行"）
                         for r, text, row_no, kind in page_rects:
                             ann = page.add_highlight_annot(r)
+                            width = 3
                             ann.set_info({
-                                "title":   f"{row_no}-{kind}",
-                                "subject": f"#{row_no}",
+                                "title":   f"{row_no:0{width}d}-{kind}",
+                                "subject": f"#{row_no:0{width}d}",
                                 "content": text
                             })
                             color = HIGHLIGHT_COLORS.get(kind, COLOR_YELLOW)
