@@ -32,6 +32,58 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
 
+# ===== [ADD] NLPテキスト保存（ON/OFF）と保存ユーティリティ =====
+SAVE_NLP_TEXT: bool = False
+SAVE_NLP_DIR: str = os.path.join(os.getcwd(), "nlp_inputs")
+
+def set_save_nlp(enable: bool, out_dir: Optional[str] = None):
+    """保存の ON/OFF を切り替え。out_dir を指定すると保存先を変更できます。"""
+    global SAVE_NLP_TEXT, SAVE_NLP_DIR
+    SAVE_NLP_TEXT = bool(enable)
+    if out_dir:
+        SAVE_NLP_DIR = str(out_dir)
+    # ON 時のみ事前作成
+    if SAVE_NLP_TEXT:
+        try:
+            os.makedirs(SAVE_NLP_DIR, exist_ok=True)
+        except Exception:
+            pass
+
+def _safe_file_part(s: str) -> str:
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    s = s.strip()
+    # ファイル名用に無難化（日本語はそのまま、記号は _）
+    return re.sub(r'[^A-Za-z0-9_.\-ぁ-んァ-ン一-龥]', '_', s)
+
+def save_nlp_input(kind: str, text: str, *, suffix: str = "", src: Optional[str] = None) -> Optional[str]:
+    """ON のとき kind/suffix 付きで .txt 保存。戻り値は保存パス（失敗時 None）。"""
+    if not SAVE_NLP_TEXT:
+        return None
+    try:
+        from datetime import datetime
+        base = SAVE_NLP_DIR or os.getcwd()
+        day = datetime.now().strftime("%Y%m%d")
+        kind_dir = os.path.join(base, day, _safe_file_part(kind))
+        os.makedirs(kind_dir, exist_ok=True)
+        ts = datetime.now().strftime("%H%M%S_%f")
+        suf = _safe_file_part(suffix) if suffix else "text"
+        fn = f"{ts}_{suf}.txt"
+        path = os.path.join(kind_dir, fn)
+        meta = []
+        if src:
+            meta.append(f"[src] {src}")
+        meta.append(f"[kind] {kind}")
+        meta_line = ("# " + " | ".join(meta) + "\n") if meta else ""
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(meta_line)
+            f.write(text or "")
+        return path
+    except Exception:
+        return None
+# ===== [/ADD] =====
+
+
 # === 帯付き Levenshtein & しきい値付き類似度判定（新規追加） ===
 def levenshtein_band(a: str, b: str, k: int) -> Optional[int]:
     """
@@ -80,6 +132,182 @@ def sim_with_threshold(a: str, b: str, th: float) -> Optional[float]:
     if d is None:
         return None
     return 1.0 - d / L
+
+# ===== [ADD] 軽量な縦組み判定＋縦テキスト復元ヘルパー =====
+def _v_is_vertical_line(ln) -> bool:
+    """rawdictの1行が縦組みっぽいかを判定（wmode/dir優先＋簡易形状）"""
+    try:
+        wmode = ln.get("wmode")
+        if isinstance(wmode, int) and wmode == 1:
+            return True
+        dirv = ln.get("dir")
+        if isinstance(dirv, (list, tuple)) and len(dirv) >= 2:
+            dx, dy = float(dirv[0]), float(dirv[1])
+            if abs(dy) > abs(dx):
+                return True
+    except Exception:
+        pass
+
+    # chars の幾何から fallback 判定（xs/ys の広がり比較）
+    def _chars_of_span(sp):
+        size = float(sp.get("size", 0.0) or 0.0)
+        chs = sp.get("chars")
+        if isinstance(chs, list) and chs:
+            for ch in chs:
+                x0, y0, x1, y1 = map(float, ch.get("bbox", (0,0,0,0)))
+                yield (x0+x1)/2.0, (y0+y1)/2.0
+        else:
+            txt = sp.get("text") or ""
+            if not txt:
+                return
+            x0, y0, x1, y1 = map(float, sp.get("bbox", (0,0,0,0)))
+            n = max(1, len(txt))
+            w = (x1-x0)/n if n else 0.0
+            for i in range(n):
+                cx = x0 + (i+0.5)*w
+                cy = (y0+y1)/2.0
+                yield cx, cy
+
+    xs, ys = [], []
+    for sp in ln.get("spans", []):
+        for cx, cy in _chars_of_span(sp):
+            xs.append(cx); ys.append(cy)
+    if len(xs) < 2:
+        return False
+
+    try:
+        import statistics as stats
+        qx = stats.quantiles(xs, n=4)
+        qy = stats.quantiles(ys, n=4)
+        iqr_x = qx[2]-qx[0]
+        iqr_y = qy[2]-qy[0]
+    except Exception:
+        # 平均平方偏差っぽい簡易
+        mx = sum(xs)/len(xs); my = sum(ys)/len(ys)
+        iqr_x = sum((x-mx)*(x-mx) for x in xs)/len(xs)
+        iqr_y = sum((y-my)*(y-my) for y in ys)/len(ys)
+
+    # “縦っぽさ”のしきいは既存と近い 1.6 倍基準
+    return (iqr_y > iqr_x * 1.6)
+
+
+def _v_page_vertical_ratio(page) -> float:
+    """ページ内の text-lines に占める“縦”行の割合（0.0〜1.0）"""
+    try:
+        rd = page.get_text("rawdict") or {}
+        blocks = rd.get("blocks", []) if isinstance(rd, dict) else []
+    except Exception:
+        return 0.0
+    v = 0
+    n = 0
+    for b in blocks:
+        if b.get("type", 1) != 0:
+            continue
+        for ln in b.get("lines", []):
+            n += 1
+            if _v_is_vertical_line(ln):
+                v += 1
+    return (v / n) if n else 0.0
+
+
+def _v_vertical_text_from_rawdict(page,
+                                  drop_ruby: bool = True,
+                                  ruby_size_ratio: float = 0.60,
+                                  col_bin_ratio: float = 0.06,
+                                  char_space_ratio: float = 0.004,
+                                  char_tab_ratio: float = 0.012) -> str:
+    """
+    縦ページ向け：rawdictの Char を全収集→Xビンで縦カラム化→
+    各カラムは上→下で連結（Δyで space/tab を挿入）。
+    """
+    rd = page.get_text("rawdict") or {}
+    blocks = rd.get("blocks", []) if isinstance(rd, dict) else []
+    if not blocks:
+        return ""
+
+    width  = float(page.rect.width)
+    height = float(page.rect.height)
+
+    # 収集：全テキストChar
+    chars = []  # (c, cx, y0, y1, size)
+    for b in blocks:
+        if b.get("type", 1) != 0:
+            continue
+        for ln in b.get("lines", []):
+            for sp in ln.get("spans", []):
+                size = float(sp.get("size", 0.0) or 0.0)
+                chs = sp.get("chars")
+                if isinstance(chs, list) and chs:
+                    for ch in chs:
+                        c = ch.get("c", "")
+                        x0,y0,x1,y1 = map(float, ch.get("bbox", (0,0,0,0)))
+                        cx = (x0+x1)/2.0
+                        chars.append((c, cx, y0, y1, size))
+                else:
+                    txt = sp.get("text") or ""
+                    if not txt:
+                        continue
+                    x0,y0,x1,y1 = map(float, sp.get("bbox", (0,0,0,0)))
+                    n = max(1, len(txt))
+                    w = (x1-x0)/n if n else 0.0
+                    for i, c in enumerate(txt):
+                        cx = x0 + (i+0.5)*w
+                        chars.append((c, cx, y0, y1, size))
+
+    if not chars:
+        return ""
+
+    # ルビ抑制：サイズ中央値の 60% 未満を除外（可変）
+    if drop_ruby:
+        try:
+            import statistics as stats
+            sizes = [sz for *_, sz in chars if sz > 0]
+            med = stats.median(sizes) if sizes else 0.0
+        except Exception:
+            med = 0.0
+        if med > 0:
+            th = med * float(ruby_size_ratio or 0.60)
+            chars = [t for t in chars if not (t[-1] and t[-1] < th)]
+            if not chars:
+                return ""
+
+    # カラム化（右→左）
+    import math
+    col_bin_w = max(8.0, float(width) * float(col_bin_ratio or 0.06))
+    from collections import defaultdict
+    cols = defaultdict(list)
+    for (c, cx, y0, y1, sz) in chars:
+        key = int(math.floor(cx / col_bin_w))
+        cols[key].append((c, cx, y0, y1, sz))
+
+    # Δy による space/tabのしきい（絶対値へ）
+    char_space_v = max(1.0, height * float(char_space_ratio or 0.004))
+    char_tab_v   = max(2.0, height * float(char_tab_ratio   or 0.012))
+
+    out_cols = []
+    for k in sorted(cols.keys(), reverse=True):   # 右→左
+        col = cols[k]
+        col.sort(key=lambda t: (t[2], t[3]))      # y0→y1
+        parts = []
+        prev_y1 = None
+        for (c, cx, y0, y1, sz) in col:
+            if prev_y1 is None:
+                parts.append(c)
+            else:
+                gap = y0 - prev_y1
+                if gap >= char_tab_v:
+                    parts.append("\t"); parts.append(c)
+                elif gap >= char_space_v:
+                    parts.append(" ");  parts.append(c)
+                else:
+                    parts.append(c)
+            prev_y1 = y1
+        t = "".join(parts).strip()
+        if t:
+            out_cols.append(t)
+
+    return "\n\n".join(out_cols)
+
 
 # ==== 読み類似スコア（数・記号は読み対象外／満点抑制の強化版） ==================
 KANJI_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]")
@@ -561,6 +789,26 @@ def reclassify_basic_for_reading_eq(df: pd.DataFrame, eps: float = 0.0005) -> pd
     return df
 # =============================================================================
 
+# ===== [ADD] phrase_reading_norm_keepchoon（長音あり読み生成） =====
+def phrase_reading_norm_keepchoon(s: str) -> str:
+    """
+    表層 s から長音「ー」を保持した読みを生成。
+    MeCabがあれば読みを使い、なければひら→カタカナ変換で代替。
+    """
+    if not isinstance(s, str) or not s:
+        return ""
+    ok, _ = ensure_mecab()
+    if ok and MECAB_TAGGER is not None:
+        toks = tokenize_mecab(s, MECAB_TAGGER)
+        parts: List[str] = []
+        for surf, pos1, lemma, reading, ct, cf in toks:
+            r = reading or hira_to_kata(nfkc(surf))
+            parts.append(r)
+        joined = "".join(parts)
+        return normalize_kana(joined, drop_choon=False)  # 長音保持
+    else:
+        return normalize_kana(hira_to_kata(nfkc(s or "")), drop_choon=False)
+
 # =============================================================================
 # 読み一致の厳密判定（前置/後置による包含を除外）
 def _readings_equal_strict(a: str, b: str) -> bool:
@@ -791,14 +1039,105 @@ def is_single_kana_char(s: str) -> bool:
     o = ord(s_norm)
     return (0x3040 <= o <= 0x309F) or (0x30A0 <= o <= 0x30FF)
 
-_ASCII = r"[A-Za-z0-9]"
+# ===== [REPLACE] 改行フラット化（英文は連結／英字1トークン・数字行は改行保持） =====
+_ALPHA_TOKEN_RE     = re.compile(r"^[A-Za-z][A-Za-z0-9\-\._/]*$")   # ← 英字1トークン（空白なし）
+_NUM_ONLY_LINE_RE   = re.compile(r"^[+\-]?\d[\d\s,./:\-–—]*$")      # 数字行（空白や桁区切りも許容）
+_ASCII_EDGE_RE      = re.compile(r"[A-Za-z0-9]")                    # ASCII 境界判定用
+
+# ===== [REPLACE] 改行処理：座標・文字サイズ・句点・タイトル考慮 =====
 def soft_join_lines_lang_aware(s: str) -> str:
+    """
+    改行を賢く処理するが、以下の条件で改行を保持する:
+    - 英字1トークン行（SSIDなど）
+    - 数字だけの行（2025など）
+    - 行末が「。」や「！」「？」で終わる場合（文章の別れ際）
+    - 特殊マーカー [KEEP_NL] が含まれる場合（座標差・サイズ差ヒント）
+    """
+    import re
+
+    KEEP = "[KEEP_NL]"
+
+    # 既存の正規表現があれば利用、無ければ安全フォールバック
+    try:
+        ALPHA_RE = _ALPHA_TOKEN_RE
+    except NameError:
+        # 英字1トークン（英数/_-. / を許可）※ハイフンはクラス末尾に置くかエスケープで安全化
+        ALPHA_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._/\-]*$")
+
+    try:
+        NUM_RE = _NUM_ONLY_LINE_RE
+    except NameError:
+        # 数字だけの行（符号/桁区切り/コロン/スラッシュ/ハイフン等）
+        NUM_RE = re.compile(r"^[\+\-]?\d[\d\s,./:\-–—]*$")
+
+    if not isinstance(s, str):
+        return s
+
+    # 空白整形
     s = s.replace("\u00A0", " ").replace("\u3000", " ").replace("\r", "")
-    s = re.sub(rf"({_ASCII})-\n((({_ASCII})))", r"\1\2", s)
-    s = re.sub(rf"({_ASCII})\n((({_ASCII})))", r"\1 \2", s)
-    s = s.replace("\n", "")
-    s = re.sub(r"[ ]{2,}", " ", s)
-    return s
+    lines = s.split("\n")
+    if len(lines) <= 1:
+        return re.sub(r"[ ]{2,}", " ", s)
+
+    def _is_alpha_single_token(line: str) -> bool:
+        t = (line or "").strip()
+        return bool(t) and bool(ALPHA_RE.fullmatch(t))
+
+    def _is_numeric_line(line: str) -> bool:
+        t = (line or "").strip()
+        return bool(t) and bool(NUM_RE.fullmatch(t))
+
+    out: list[str] = []
+    for i, cur in enumerate(lines):
+        nxt = lines[i + 1] if i + 1 < len(lines) else ""
+        cur_is_keep_only = (cur.strip() == KEEP)          # ★ 追加
+        cur_has_keep = (KEEP in cur)
+        nxt_has_keep = (KEEP in nxt)
+
+
+        if cur_is_keep_only:
+            continue
+
+
+        cur_clean = cur.replace(KEEP, "").strip()
+        out.append(cur_clean)
+
+        if i == len(lines) - 1:
+            break
+
+        # 改行保持条件
+        keep_nl = False
+        if cur_has_keep or nxt_has_keep:
+            keep_nl = True
+        elif _is_alpha_single_token(cur_clean) or _is_alpha_single_token(nxt.replace(KEEP, "").strip()):
+            keep_nl = True
+        elif _is_numeric_line(cur_clean) or _is_numeric_line(nxt.replace(KEEP, "").strip()):
+            keep_nl = True
+        elif cur_clean.endswith(("。", "！", "?", "？")):
+            keep_nl = True
+
+        if keep_nl:
+            out.append("\n")
+            continue
+
+        # 英単語の行末ハイフン → 次行の英単語へ連結（ハイフン除去）
+        nxt_clean = nxt.replace(KEEP, "").strip()
+        if cur_clean.endswith("-") and re.match(r"^[A-Za-z]", nxt_clean or ""):
+            out[-1] = cur_clean[:-1]  # 末尾 '-' を落として完全連結
+            continue
+
+        # ASCIIどうしの境界は空白1個で連結
+        if re.search(r"[A-Za-z0-9]$", cur_clean or "") and re.match(r"^[A-Za-z0-9]", nxt_clean or ""):
+            out.append(" ")
+            continue
+
+        # その他は改行除去（= ベタ結合）
+        continue
+
+    joined = "".join(out)
+    joined = re.sub(r"[ ]{2,}", " ", joined)
+    return joined
+# ===== [/REPLACE] =====
 
 @dataclass
 class PageData:
@@ -806,59 +1145,59 @@ class PageData:
     page: int
     text_join: str
 
-# ====== ここから差し替え（堅めのフォールバック入り） ======
+# ===== [REPLACE] 完全対応版 _compose_text_from_rawdict（KEEP_NL挿入） =====
 def _compose_text_from_rawdict(
     page,
     *,
-    vertical_strategy: str = "auto",   # "auto" | "force_v" | "force_h"
+    vertical_strategy: str = "auto",  # "auto" | "force_v" | "force_h" | "strict_y"
     drop_marginal: bool = False,
     margin_ratio: float = 0.045,
-
-    # カラム検出
-    col_bin_ratio_h: float = 0.08,     # 横: ビン幅（ページ幅比）
-    col_bin_ratio_v: float = 0.06,     # 縦: ビン幅（ページ幅比; やや細かめ）
-
-    # ギャップ閾値
-    span_space_ratio_h: float = 0.006, # 横: スペース
-    cell_tab_ratio_h: float   = 0.018, # 横: タブ
-    char_space_ratio_v: float = 0.004, # 縦: charベース スペース
-    char_tab_ratio_v: float   = 0.012, # 縦: charベース タブ
-
-    # ルビ抑制
+    col_bin_ratio_h: float = 0.08,
+    col_bin_ratio_v: float = 0.06,
+    span_space_ratio_h: float = 0.006,
+    cell_tab_ratio_h: float = 0.018,
+    char_space_ratio_v: float = 0.004,
+    char_tab_ratio_v: float = 0.012,
     drop_ruby: bool = True,
-    ruby_size_ratio: float = 0.60,     # 行の中央値サイズ × 0.60 未満をルビ候補
-):
+    ruby_size_ratio: float = 0.60,
+) -> str:
     """
-    縦組み強化版のブロック整形:
-      - 行ごとに縦横判定（wmode / dir / char分布のIQR比）
-      - 縦行は char 単位で連結（スペース/タブ判定は Δy）
-      - 縦カラムは x中心でクラスタ → 右→左に結合
-      - 横は従来の spanベース（Δx）で連結
+    PDF rawdictを座標ベースでテキスト復元し、横組みの改行整理(KEEP_NL)は維持。
+    縦組みの行内/列内連結と strict_y の縦クラスタ処理を移植して一体化。
+
+    - 横組み: 既存の「A~C条件の行結合＋英数連結時のスペース補完＋境界行除外＋KEEP_NL挿入」を維持
+    - 縦組み: charsベース連結(Δyでspace/tab)＋ルビ除去(中央値×比率)に置換
+               strict_y 時はページ全体の縦文字クラウド→列クラスタ→右→左／上→下で連結
     """
-    rd = page.get_text("rawdict")
+    import statistics
+    from collections import defaultdict
+
+    KEEP = "[KEEP_NL]"
+
+    # 1) rawdict 取得
+    try:
+        rd = page.get_text("rawdict") or {}
+    except Exception:
+        rd = {}
     blocks = rd.get("blocks", []) if isinstance(rd, dict) else []
     if not blocks:
         return ""
 
-    width  = float(page.rect.width)
+    width = float(page.rect.width)
     height = float(page.rect.height)
 
-    # 絶対値へ
-    span_space_h = max(1.5, width  * span_space_ratio_h)
-    cell_tab_h   = max(3.0, width  * cell_tab_ratio_h)
-    char_space_v = max(1.0, height * char_space_ratio_v)
-    char_tab_v   = max(2.0, height * char_tab_ratio_v)
+    # しきい値 (絶対値化)
+    span_space_h = max(1.5, width * float(span_space_ratio_h or 0.0))
+    cell_tab_h = max(3.0, width * float(cell_tab_ratio_h or 0.0))
+    char_space_v = max(1.0, height * float(char_space_ratio_v or 0.0))
+    char_tab_v = max(2.0, height * float(char_tab_ratio_v or 0.0))
+    col_bin_w_h = max(16.0, width * float(col_bin_ratio_h or 0.0))
+    col_bin_w_v = max(12.0, width * float(col_bin_ratio_v or 0.0))
+    top_margin = height * float(margin_ratio or 0.0)
+    bot_margin = height * (1.0 - float(margin_ratio or 0.0))
 
-    col_bin_w_h = max(16.0, width * col_bin_ratio_h)
-    col_bin_w_v = max(12.0, width * col_bin_ratio_v)
-
-    top_margin = height * margin_ratio
-    bot_margin = height * (1.0 - margin_ratio)
-
-    from collections import defaultdict
-    import statistics as stats
-
-    def _span_text(sp) -> str:
+    # ヘルパー: span→テキスト
+    def _span_text(sp):
         t = sp.get("text") or ""
         if t.strip():
             return t
@@ -867,34 +1206,8 @@ def _compose_text_from_rawdict(
             return "".join(ch.get("c", "") for ch in chs)
         return ""
 
-    def _line_chars(ln):
-        """行内の char 配列を平坦化して返す。各要素: (c, x0,y0,x1,y1, size)"""
-        out = []
-        for sp in ln.get("spans", []):
-            size = float(sp.get("size", 0.0) or 0.0)
-            chs = sp.get("chars")
-            if isinstance(chs, list) and chs:
-                for ch in chs:
-                    c = ch.get("c", "")
-                    x0,y0,x1,y1 = map(float, ch.get("bbox", (0,0,0,0)))
-                    out.append((c,x0,y0,x1,y1,size))
-            else:
-                # charsが無い場合はspan.textを1文字ずつ（近似）
-                t = sp.get("text") or ""
-                if not t:
-                    continue
-                x0,y0,x1,y1 = map(float, sp.get("bbox", (0,0,0,0)))
-                # 幅/文字数で荒く分割（均等割り）
-                n = max(1, len(t))
-                w = (x1 - x0) / n if n else 0
-                for i, c in enumerate(t):
-                    cx0 = x0 + i*w
-                    cx1 = cx0 + w
-                    out.append((c, cx0, y0, cx1, y1, size))
-        return out
-
+    # ヘルパー: 行の縦判定（wmode/dir 優先＋文字分布のIQR比）
     def _is_vertical_line(ln) -> bool:
-        # 1) wmode / dir を優先
         wmode = ln.get("wmode")
         if isinstance(wmode, int) and wmode == 1:
             return True
@@ -906,111 +1219,93 @@ def _compose_text_from_rawdict(
                     return True
             except Exception:
                 pass
-
-        # 2) char 分布で判定（IQR 比でロバスト）
-        chars = _line_chars(ln)
+        # fallback: 行の文字分布
+        chars = []
+        for sp in ln.get("spans", []):
+            size = float(sp.get("size", 0.0) or 0.0)
+            chs = sp.get("chars")
+            if isinstance(chs, list) and chs:
+                for ch in chs:
+                    c = ch.get("c", "")
+                    x0, y0, x1, y1 = map(float, ch.get("bbox", (0, 0, 0, 0)))
+                    chars.append((c, x0, y0, x1, y1, size))
+            else:
+                t = sp.get("text") or ""
+                if not t:
+                    continue
+                x0, y0, x1, y1 = map(float, sp.get("bbox", (0, 0, 0, 0)))
+                n = max(1, len(t))
+                w = (x1 - x0) / n if n else 0.0
+                for i, c in enumerate(t):
+                    cx0 = x0 + i * w
+                    cx1 = cx0 + w
+                    chars.append((c, cx0, y0, cx1, y1, size))
         if len(chars) < 2:
-            return False  # 情報不足→横扱い
-        xs = [(x0+x1)/2 for _,x0,y0,x1,y1,_ in chars]
-        ys = [(y0+y1)/2 for _,x0,y0,x1,y1,_ in chars]
+            return False
+        xs = [(x0 + x1) / 2.0 for _, x0, _, x1, _, _ in chars]
+        ys = [(y0 + y1) / 2.0 for _, _, y0, _, y1, _ in chars]
         try:
-            iqr_x = stats.quantiles(xs, n=4)[2] - stats.quantiles(xs, n=4)[0]
-            iqr_y = stats.quantiles(ys, n=4)[2] - stats.quantiles(ys, n=4)[0]
+            import statistics as stats
+            qx = stats.quantiles(xs, n=4)
+            qy = stats.quantiles(ys, n=4)
+            iqr_x = qx[2] - qx[0]
+            iqr_y = qy[2] - qy[0]
         except Exception:
-            # フォールバック：分散比
-            import math
-            mean_x = sum(xs)/len(xs); mean_y = sum(ys)/len(ys)
-            iqr_x = sum((x-mean_x)**2 for x in xs)/len(xs)
-            iqr_y = sum((y-mean_y)**2 for y in ys)/len(ys)
-        # y広がりが明確に大きければ縦
+            mx = sum(xs) / len(xs)
+            my = sum(ys) / len(ys)
+            iqr_x = sum((x - mx) * (x - mx) for x in xs) / len(xs)
+            iqr_y = sum((y - my) * (y - my) for y in ys) / len(ys)
         return (iqr_y > iqr_x * 1.6)
 
-    def _build_line_text_vertical(ln) -> str:
-        """縦行を char 単位で復元（ルビ抑制・Δyでスペ/タブ判定）"""
-        chars = _line_chars(ln)
-        if not chars:
-            return ""
-        # ルビ抑制のため、行のフォントサイズ中央値
-        if drop_ruby:
-            sizes = [sz for *_, sz in chars if sz > 0]
-            med = stats.median(sizes) if sizes else 0.0
-        # 読みは上→下
-        chars.sort(key=lambda t: t[2])  # y0
-
-        parts = []
-        prev_y1 = None
-        for c, x0, y0, x1, y1, sz in chars:
-            if drop_ruby and med and sz and sz < med * ruby_size_ratio:
-                # ルビはスキップ
-                continue
-            if prev_y1 is None:
-                parts.append(c)
+    # 横行の X 範囲（横結合のA条件用）
+    def _line_x_range(ln):
+        xs = []
+        for sp in ln.get("spans", []):
+            chs = sp.get("chars")
+            if isinstance(chs, list) and chs:
+                for ch in chs:
+                    x0, _, x1, _ = map(float, ch.get("bbox", (0, 0, 0, 0)))
+                    xs += [x0, x1]
             else:
-                gap = y0 - prev_y1
-                if gap >= char_tab_v:
-                    parts.append("\t"); parts.append(c)
-                elif gap >= char_space_v:
-                    parts.append(" ");  parts.append(c)
-                else:
-                    parts.append(c)
-            prev_y1 = y1
-        return "".join(parts).strip()
+                x0, _, x1, _ = map(float, sp.get("bbox", (0, 0, 0, 0)))
+                xs += [x0, x1]
+        if not xs:
+            return None
+        return (min(xs), max(xs))
 
-    def _build_line_text_horizontal(ln, span_space=span_space_h, cell_tab=cell_tab_h) -> str:
-        spans = ln.get("spans", [])
-        if not spans:
-            return ""
-        # xで並べ替え
-        spans = sorted(spans, key=lambda sp: float(sp.get("bbox", [0,0,0,0])[0]))
-        parts = []
-        prev_x1 = None
-        for sp in spans:
-            txt = (_span_text(sp) or "").replace("\u00A0", " ").strip()
-            if not txt:
-                continue
-            x0, y0, x1, y1 = map(float, sp.get("bbox", (0,0,0,0)))
-            if prev_x1 is None:
-                parts.append(txt)
-            else:
-                gap = x0 - prev_x1
-                if gap >= cell_tab:
-                    parts.append("\t"); parts.append(txt)
-                elif gap >= span_space:
-                    parts.append(" ");  parts.append(txt)
-                else:
-                    parts.append(txt)
-            prev_x1 = x1
-        return "".join(parts).strip()
-
-    # ---- ブロック収集＆行ごとに縦横付与 ----
+    # ブロック収集（座標・行群・フォント中央値）
     blist = []
     for b in blocks:
         if b.get("type", 1) != 0:
             continue
-        x0,y0,x1,y1 = map(float, b.get("bbox", (0,0,0,0)))
+        x0, y0, x1, y1 = map(float, b.get("bbox", (0, 0, 0, 0)))
         if drop_marginal and (y1 <= top_margin or y0 >= bot_margin):
             continue
         lines = b.get("lines", [])
         if not lines:
             continue
-
-        # 行ごとの縦横
         ln_items = []
-        v_cnt = 0; h_cnt = 0
+        v_cnt, h_cnt = 0, 0
+        sizes = []
         for ln in lines:
+            for sp in ln.get("spans", []):
+                sz = float(sp.get("size", 0.0) or 0.0)
+                if sz > 0:
+                    sizes.append(sz)
             is_v = _is_vertical_line(ln)
             ln_items.append((ln, is_v))
-            if is_v: v_cnt += 1
-            else:    h_cnt += 1
-
+            v_cnt += int(bool(is_v))
+            h_cnt += int(not is_v)
         orient = "v" if v_cnt > h_cnt else "h"
+        font_med = statistics.median(sizes) if sizes else 0.0
         blist.append({
-            "bbox": (x0,y0,x1,y1),
+            "bbox": (x0, y0, x1, y1),
             "x0": x0, "y0": y0, "x1": x1, "y1": y1,
             "lines_oriented": ln_items,
-            "orient": orient
+            "orient": orient,
+            "font_med": font_med,
+            "page_num": page.number,
         })
-
     if not blist:
         return ""
 
@@ -1021,195 +1316,354 @@ def _compose_text_from_rawdict(
         page_mode = "v"
     elif vertical_strategy == "force_h":
         page_mode = "h"
-    else:
+    else:  # "auto" or "strict_y"
         page_mode = "v" if v_total > h_total else "h"
 
-    # カラムバスケット
-    cols_h = defaultdict(list)
-    cols_v = defaultdict(list)
-
-    for tb in blist:
-        if tb["orient"] == "v":
-            # 縦：x中心でビン
-            cx = (tb["x0"] + tb["x1"]) / 2
-            key = int(cx // col_bin_w_v)
-            cols_v[key].append(tb)
-        else:
-            key = int(tb["x0"] // col_bin_w_h)
-            cols_h[key].append(tb)
-
-    def _build_block_text(tb, vertical_block: bool) -> str:
-        texts = []
-        for ln, is_v in tb["lines_oriented"]:
-            if vertical_block or is_v:
-                t = _build_line_text_vertical(ln)
+    # === 横ブロックの統合処理（既存の正しいロジックを維持） ===
+    def _line_info_horizontal(ln, span_space_h: float, cell_tab_h: float) -> dict:
+        """横組み1行からテキスト/座標/フォントサイズを抽出"""
+        spans = ln.get("spans", [])
+        if not spans:
+            return {}
+        spans = sorted(spans, key=lambda sp: float(sp.get("bbox", [0, 0, 0, 0])[0]))
+        parts, font_sizes = [], []
+        prev_x1 = None
+        x_min = x_max = y_top = y_bottom = None
+        for sp in spans:
+            txt = (_span_text(sp) or "").replace("\u00A0", " ").strip()
+            if not txt:
+                continue
+            x0, y0, x1, y1 = map(float, sp.get("bbox", (0, 0, 0, 0)))
+            x_min = x0 if x_min is None else min(x_min, x0)
+            x_max = x1 if x_max is None else max(x_max, x1)
+            y_top = y0 if y_top is None else min(y_top, y0)
+            y_bottom = y1 if y_bottom is None else max(y_bottom, y1)
+            fs = float(sp.get("size", 0.0) or 0.0)
+            if fs > 0:
+                font_sizes.append(fs)
+            if prev_x1 is None:
+                parts.append(txt)
             else:
-                t = _build_line_text_horizontal(ln)
-            if t:
-                texts.append(t)
-        return "\n".join(texts)
+                gap = x0 - prev_x1
+                if gap >= cell_tab_h:
+                    parts.append("\t")
+                    parts.append(txt)
+                elif gap >= span_space_h:
+                    parts.append(" ")
+                    parts.append(txt)
+                else:
+                    parts.append(txt)
+            prev_x1 = x1
+        text = "".join(parts).strip()
+        if not text:
+            return {}
+        font_size = font_sizes[0] if font_sizes else 0.0
+        line_height = (y_bottom - y_top) if (y_bottom is not None and y_top is not None) else 0.0
+        return {
+            "text": text,
+            "x0": x_min,
+            "x1": x_max,
+            "top": y_top,
+            "height": line_height,
+            "font_size": font_size,
+        }
 
-    # 横: 左→右
-    parts_h = []
-    for ck in sorted(cols_h.keys()):
-        col_blocks = sorted(cols_h[ck], key=lambda b: (b["y0"], b["x0"]))
-        col_texts = []
-        for b in col_blocks:
-            t = _build_block_text(b, vertical_block=False)
-            if t:
-                col_texts.append(t)
-        if col_texts:
-            parts_h.append("\n".join(col_texts))
+    # 全横ブロックから全横行を収集（出現順を維持）
+    all_h_lines = []
+    for tb in blist:
+        if tb["orient"] != "h":
+            continue
+        for ln, is_v in tb["lines_oriented"]:
+            if is_v:
+                continue
+            line_info = _line_info_horizontal(ln, span_space_h, cell_tab_h)
+            if line_info:
+                all_h_lines.append(line_info)
 
-    # 縦: 右→左（ck降順）
-    parts_v = []
-    for ck in sorted(cols_v.keys(), reverse=True):
-        col_blocks = sorted(cols_v[ck], key=lambda b: (b["y0"], b["x0"]))
-        col_texts = []
-        for b in col_blocks:
-            t = _build_block_text_vertical_charcloud(
-                b,
-                char_space_v=char_space_v,
-                char_tab_v=char_tab_v,
-                drop_ruby=True,
-                ruby_size_ratio=0.60
+    # A~C条件で横行を結合（KEEP_NL維持・英数スペース補完・境界行除外）
+    def _merge_all_horizontal_lines(line_dicts: list[dict]) -> str:
+        import re
+        KEEP = "[KEEP_NL]"  # 保険で再定義
+
+        def _is_merge_exempt(text: str) -> bool:
+            s = re.sub(r'\s+', '', text or '')
+            if not s:
+                return False
+            # 数字だけの行
+            if re.fullmatch(r'[0-9]+', s):
+                return True
+            # 1文字のASCII英字 or ASCII記号だけの行
+            if len(s) == 1 and re.fullmatch(r'[A-Za-z]'
+                                            r'|[ -/:-@\[-`{-~]', s):
+                return True
+            return False
+
+        def _smart_join(a: str, b: str) -> str:
+            if not a:
+                return b or ''
+            if not b:
+                return a
+            # 英数がくっつくのを防ぐ
+            if re.search(r'[A-Za-z0-9]$', a) and re.search(r'^[A-Za-z0-9]', b):
+                return a + ' ' + b
+            return a + b
+
+        if not line_dicts:
+            return ""
+        merged: list[str] = []
+        buffer = line_dicts[0]["text"]
+        for i in range(1, len(line_dicts)):
+            prev_line = line_dicts[i - 1]
+            curr_line = line_dicts[i]
+
+            if _is_merge_exempt(prev_line["text"]) or _is_merge_exempt(curr_line["text"]):
+                merged.append(buffer + KEEP)
+                buffer = curr_line["text"]
+                continue
+
+            # A: X範囲交差
+            x_overlap = not (prev_line["x1"] < curr_line["x0"] or curr_line["x1"] < prev_line["x0"])
+            # B: 下方向 & 行高×2以内
+            y_condition = (curr_line["top"] > prev_line["top"]) and (
+                (curr_line["top"] - prev_line["top"]) <= 2.0 * max(1.0, prev_line["height"])
             )
-            if t:
-                col_texts.append(t)
-        if col_texts:
-            parts_v.append("\n".join(col_texts))
+            # C: フォント差（±10%以内）
+            prev = float(prev_line.get("font_size") or 0.0)
+            curr = float(curr_line.get("font_size") or 0.0)
+            TOL = 0.10
+            font_diff_ok = (
+                (prev == 0.0 and curr == 0.0)
+                or (prev > 0.0 and curr > 0.0 and (1 - TOL) <= (curr / prev) <= (1 + TOL))
+            )
 
+            if x_overlap and y_condition and font_diff_ok:
+                buffer = _smart_join(buffer, curr_line["text"])
+            else:
+                merged.append(buffer + KEEP)
+                buffer = curr_line["text"]
 
-    if page_mode == "v":
-        chunks = []
-        if parts_v: chunks.append("\n".join(parts_v))
-        if parts_h: chunks.append("\n".join(parts_h))
-        return "\n\n".join([c for c in chunks if c])
-    else:
-        chunks = []
-        if parts_h: chunks.append("\n".join(parts_h))
-        if parts_v: chunks.append("\n".join(parts_v))
-        return "\n\n".join([c for c in chunks if c])
+        merged.append(buffer)  # 最後のバッファ確定
+        return "\n".join(merged)
 
-def _build_block_text_vertical_charcloud(tb,
-                                         *,
-                                         char_space_v: float,
-                                         char_tab_v: float,
-                                         drop_ruby: bool = True,
-                                         ruby_size_ratio: float = 0.60) -> str:
-    """
-    縦ブロックを、行を信用せずブロック内の全Charから再構成。
-    - X中心でカラム化（右→左の順）
-    - 各カラムは Y 昇順で連結、ΔYでスペース/タブを挿入
-    """
-    lines_oriented = tb.get("lines_oriented") or []
-    # ---- 1) 全Char収集 ----
-    chars = []
-    for ln, _is_v in lines_oriented:
+    parts_h_text = _merge_all_horizontal_lines(all_h_lines) if all_h_lines else ""
+
+    # === 縦行の復元（移植：縦版の char ベース + ルビ除去） ===
+    def _build_line_text_vertical(ln) -> str:
+        """
+        縦行の復元: char を Y昇順で連結（Δyで space/tab）
+        - chars が無い span は Y 方向に等分して擬似文字座標を生成
+        - ルビ除去: 行内フォントサイズの中央値 × ruby_size_ratio 未満を削除
+        """
+        import statistics as stats
+
+        chars = []
         for sp in ln.get("spans", []):
             size = float(sp.get("size", 0.0) or 0.0)
             chs = sp.get("chars")
             if isinstance(chs, list) and chs:
                 for ch in chs:
-                    c  = ch.get("c", "")
-                    x0,y0,x1,y1 = map(float, ch.get("bbox", (0,0,0,0)))
-                    cx = (x0 + x1) / 2.0
-                    cy = (y0 + y1) / 2.0
-                    chars.append((c, cx, cy, y0, y1, size))
+                    c = ch.get("c", "")
+                    x0, y0, x1, y1 = map(float, ch.get("bbox", (0, 0, 0, 0)))
+                    chars.append((c, x0, y0, x1, y1, size))
             else:
-                # charsが無い場合のフォールバック: span.text を均等割り（精度は低下）
-                t = (sp.get("text") or "")
+                t = sp.get("text") or ""
                 if not t:
                     continue
-                x0,y0,x1,y1 = map(float, sp.get("bbox", (0,0,0,0)))
+                x0, y0, x1, y1 = map(float, sp.get("bbox", (0, 0, 0, 0)))
                 n = max(1, len(t))
-                w = (x1 - x0) / n if n else 0
+                h = (y1 - y0) / n if n else 0.0
                 for i, c in enumerate(t):
-                    cx = x0 + (i + 0.5) * w
-                    cy = (y0 + y1) / 2.0
-                    chars.append((c, cx, cy, y0, y1, size))
-
-    if not chars:
-        return ""
-
-    # ルビ抑制（サイズ中央値の比で判定）
-    if drop_ruby:
-        import statistics as stats
-        sizes = [sz for *_, sz in chars if sz > 0]
-        med = stats.median(sizes) if sizes else 0.0
-        if med > 0:
-            chars = [t for t in chars if not (t[-1] and t[-1] < med * ruby_size_ratio)]
+                    ly0 = y0 + i * h
+                    ly1 = ly0 + h
+                    chars.append((c, x0, ly0, x1, ly1, size))
         if not chars:
             return ""
 
-    # ---- 2) カラム化（X 量子化 → 右→左）----
-    # カラムのビン幅はブロック幅の数%程度にしておくと安定
-    x0, y0, x1, y1 = tb["x0"], tb["y0"], tb["x1"], tb["y1"]
-    bw = max(1.0, (x1 - x0))
-    col_bin_w = max(8.0, bw * 0.06)   # 必要なら外から渡してもOK
+        # ルビ抑制
+        med = 0.0
+        if drop_ruby:
+            sizes = [sz for *_, sz in chars if sz > 0]
+            med = (stats.median(sizes) if sizes else 0.0)
+            if med > 0:
+                chars = [t for t in chars if not (t[-1] and t[-1] < med * float(ruby_size_ratio or 0.60))]
+        if not chars:
+            return ""
 
-    from collections import defaultdict
-    cols = defaultdict(list)
-    for c, cx, cy, ly0, ly1, sz in chars:
-        key = int((cx - x0) // col_bin_w)
-        cols[key].append((c, cx, cy, ly0, ly1, sz))
-
-    # 右→左（キー降順）で処理
-    texts = []
-    for k in sorted(cols.keys(), reverse=True):
-        col = cols[k]
-        # カラム内は上→下（cy昇順）
-        col.sort(key=lambda t: t[2])
+        # 上→下（y0 昇順）で連結、Δy で space/tab
+        chars.sort(key=lambda t: t[2])  # y0
         parts = []
         prev_y1 = None
-        for (c, cx, cy, ly0, ly1, sz) in col:
+        for c, x0, y0, x1, y1, sz in chars:
             if prev_y1 is None:
                 parts.append(c)
             else:
-                gap = ly0 - prev_y1
+                gap = y0 - prev_y1
                 if gap >= char_tab_v:
                     parts.append("\t"); parts.append(c)
                 elif gap >= char_space_v:
-                    parts.append(" ");  parts.append(c)
+                    parts.append(" "); parts.append(c)
                 else:
                     parts.append(c)
-            prev_y1 = ly1
-        t = "".join(parts).strip()
-        if t:
-            texts.append(t)
+            prev_y1 = y1
+        return "".join(parts).strip()
 
-    # カラム間は空行で分離
-    return "\n\n".join(texts)
+    # === strict_y: ページ全体の縦charクラウド方式（移植） ===
+    if page_mode == "v" and vertical_strategy == "strict_y":
+        # 1) 縦行の char をページ全体から収集（chars 無しは Y 等分フォールバック）
+        vchars = []  # (c, cx, y0, y1, size)
+        for tb in blist:
+            for ln, is_v in tb["lines_oriented"]:
+                if not is_v:
+                    continue
+                for sp in ln.get("spans", []):
+                    size = float(sp.get("size", 0.0) or 0.0)
+                    chs = sp.get("chars")
+                    if isinstance(chs, list) and chs:
+                        for ch in chs:
+                            c = ch.get("c", "")
+                            x0, y0, x1, y1 = map(float, ch.get("bbox", (0, 0, 0, 0)))
+                            cx = (x0 + x1) / 2.0
+                            vchars.append((c, cx, y0, y1, size))
+                    else:
+                        t = sp.get("text") or ""
+                        if not t:
+                            continue
+                        x0, y0, x1, y1 = map(float, sp.get("bbox", (0, 0, 0, 0)))
+                        n = max(1, len(t))
+                        h = (y1 - y0) / n if n else 0.0
+                        cx = (x0 + x1) / 2.0
+                        for i, c in enumerate(t):
+                            ly0 = y0 + i * h
+                            ly1 = ly0 + h
+                            vchars.append((c, cx, ly0, ly1, size))
+        if not vchars:
+            return parts_h_text or ""
 
-def extract_pages(pdf_path: str, *,
-                  flatten_for_nlp: bool = False) -> List[PageData]:
-    """
-    1) rawdict 座標ベースで復元
-    2) 空なら 'blocks' でフォールバック
-    3) それでも空なら 'text' で最後のフォールバック
-    """
+        # 2) ルビ除去（中央値×比率）
+        if drop_ruby:
+            sizes = [sz for *_, sz in vchars if sz > 0]
+            med = statistics.median(sizes) if sizes else 0.0
+            if med > 0:
+                vchars = [t for t in vchars if not (t[-1] and t[-1] < med * float(ruby_size_ratio or 0.60))]
+        if not vchars:
+            return parts_h_text or ""
+
+        # 3) X で列クラスタ（小さめビンで隣列の混在を防ぐ）
+        bin_w = max(8.0, width * 0.020) #0.020ものによって要調整
+        cols = defaultdict(list)
+        for c, cx, y0, y1, sz in vchars:
+            key = int(cx // bin_w)
+            cols[key].append((c, cx, y0, y1, sz))
+
+        # 4) 各列を Y 昇順で連結 → 列は 右→左
+        out_cols = []
+        for k in sorted(cols.keys(), reverse=True):
+            col = cols[k]
+            col.sort(key=lambda t: t[2])  # y0
+            parts = []
+            prev_y1 = None
+            for c, cx, y0, y1, sz in col:
+                if prev_y1 is None:
+                    parts.append(c)
+                else:
+                    gap = y0 - prev_y1
+                    if gap >= char_tab_v:
+                        parts.append("\t"); parts.append(c)
+                    elif gap >= char_space_v:
+                        parts.append(" "); parts.append(c)
+                    else:
+                        parts.append(c)
+                prev_y1 = y1
+            t = "".join(parts).strip()
+            if t:
+                out_cols.append(t)
+
+        chunks = []
+        if out_cols:
+            chunks.append("\n\n".join(out_cols))  # 列区切りは空行
+        if parts_h_text:
+            chunks.append(parts_h_text)
+        return "\n\n".join([c for c in chunks if c])
+
+    # === 既存の縦クラスタ(列単位) ===
+    cols_v = defaultdict(list)
+    for tb in blist:
+        if tb["orient"] == "v":
+            cx = (tb["x0"] + tb["x1"]) / 2.0
+            key = int(cx // col_bin_w_v)
+            cols_v[key].append(tb)
+
+    # 縦ブロック → 行テキスト生成（移植した行復元を使用）
+    def _build_block_text_v(tb) -> str:
+        texts = []
+        for ln, is_v in tb["lines_oriented"]:
+            if not is_v:
+                continue
+            t = _build_line_text_vertical(ln)
+            if t:
+                texts.append(t)
+        return "\n".join(texts)
+
+    parts_v = []
+    for ck in sorted(cols_v.keys(), reverse=True):  # 右→左
+        col_blocks = sorted(cols_v[ck], key=lambda b: (b["y0"], b["x0"]))
+        col_texts = []
+        for b in col_blocks:
+            t = _build_block_text_v(b)
+            if t:
+                col_texts.append(t)
+        if col_texts:
+            parts_v.append("\n".join(col_texts))
+
+    # ページ合成（縦→横 / 横→縦）
+    if page_mode == "v":
+        chunks = []
+        if parts_v:
+            chunks.append("\n".join(parts_v))
+        if parts_h_text:
+            chunks.append(parts_h_text)
+        return "\n\n".join([c for c in chunks if c])
+    else:
+        chunks = []
+        if parts_h_text:
+            chunks.append(parts_h_text)
+        if parts_v:
+            chunks.append("\n".join(parts_v))
+        return "\n\n".join([c for c in chunks if c])
+
+
+# ===== [PATCH] extract_pages: v_strategy 引数を追加して _compose に受け渡し =====
+def extract_pages(pdf_path: str, *, flatten_for_nlp: bool = False, v_strategy: str = "auto") -> List[PageData]:
+
+
+    def _remove_invisible_chars(s: str) -> str:
+        if not isinstance(s, str):
+            return s
+        # 制御文字（Cc, Cf）を削除。ただし改行・タブは残す
+        return "".join(ch for ch in s if not (
+            unicodedata.category(ch) in ("Cc", "Cf") and ch not in ("\n", "\t")
+        ))
+
+
     pages: List[PageData] = []
     doc = fitz.open(pdf_path)
     try:
         for i in range(len(doc)):
             page = doc[i]
-
-            # ① rawdict
+            # ① rawdict（ここで縦横判定＋縦復元を実施）
             text_blocked = _compose_text_from_rawdict(
                 page,
-                vertical_strategy="auto",   # ← 縦横自動
-                drop_marginal=False,        # 必要に応じて True に
+                vertical_strategy=v_strategy,  # ← ここを引数で指定可能に
+                drop_marginal=False,
                 margin_ratio=0.05
             )
-
-            # ② blocks フォールバック
+            # （以下は従来どおりのフォールバック）...
             if not text_blocked.strip():
                 try:
                     blks = page.get_text("blocks")
                 except Exception:
                     blks = []
                 if blks:
-                    # (x0,y0,x1,y1, text, block_no, block_type) 形式を想定
                     blks_sorted = sorted(blks, key=lambda t: (t[0], t[1]))
                     parts = []
                     for b in blks_sorted:
@@ -1218,35 +1672,29 @@ def extract_pages(pdf_path: str, *,
                             if txt:
                                 parts.append(txt)
                     text_blocked = "\n".join(parts)
-
-            # ③ text 最終フォールバック
             if not text_blocked.strip():
                 text_blocked = page.get_text("text") or ""
 
-            # NLP用に改行を潰したい場合は既存関数で
-            text_final = soft_join_lines_lang_aware(text_blocked) if flatten_for_nlp else text_blocked
+            text_blocked = _remove_invisible_chars(text_blocked)    
 
+            text_final = soft_join_lines_lang_aware(text_blocked) if flatten_for_nlp else text_blocked
             pages.append(PageData(os.path.basename(pdf_path), i + 1, text_final))
     finally:
         doc.close()
     return pages
+# ===== [/PATCH] =====
 
-# ====== ここまで差し替え ======
 
-# ===== 追加: レイアウト由来の“強制区切り”でセグメント化 =====
-_HARD_BREAK_RE = re.compile(r"[\t\r\n]+")
-
+# ===== [REPLACE] レイアウト分割を無効化（常に全体1本） =====
 def iter_nlp_segments(text: str):
     """
-    レイアウト由来の区切り（改行・タブ）でテキストを分割し、
-    空セグメントを除いて順に返す。
+    以前は改行・タブで分割していたが、
+    版面由来の分割を一切やめ、テキスト全体をそのまま返す。
     """
-    if not isinstance(text, str) or not text:
-        return
-    for seg in _HARD_BREAK_RE.split(text):
-        seg = seg.strip()
-        if seg:
-            yield seg
+    if isinstance(text, str) and text:
+        yield text
+# ===== [/REPLACE] =====
+
 
 # ===== GiNZA: 軽量モデル + 文節専用で初期化（差し替え） =====
 HAS_GINZA = False
@@ -1284,102 +1732,357 @@ except Exception:
     GINZA_NLP = None
 # ===== GiNZA 初期化ここまで =====
 
-# ===== 差し替え：GiNZA 文節抽出（並列 nlp.pipe + 文節専用） =====
+# ===== [NEW] GiNZA 文節抽出：文章リストから処理 =====
+def ginza_bunsetsu_from_sentences(sentences: list[str]) -> list[str]:
+    """
+    GiNZAで文節を抽出するが、入力は文単位のリスト。
+    - 各文をGiNZAに渡してbunsetsu_spansで抽出
+    - 長さフィルタは従来通り（1..120）
+    """
+    if not sentences or not HAS_GINZA or GINZA_NLP is None:
+        return []
+
+    chunks: list[str] = []
+    try:
+        pipes_to_enable = [p for p in ["parser", "bunsetu_recognizer"] if p in GINZA_NLP.pipe_names]
+        with GINZA_NLP.select_pipes(enable=pipes_to_enable):
+            for doc in GINZA_NLP.pipe(sentences, n_process=1, batch_size=8):
+                for sent in doc.sents:
+                    for sp in ginza.bunsetu_spans(sent):
+                        s = re.sub(r"[\t\r\n]+", " ", sp.text).strip()
+                        if 1 <= len(s) <= 120:
+                            chunks.append(s)
+    except Exception:
+        return []
+    return chunks
+
+# ===== [REPLACE] GiNZA 文節抽出：全文1本で処理 =====
 def ginza_bunsetsu_chunks(text: str) -> list[str]:
     """
-    GiNZA を '文節だけ' に限定して高速に抽出する:
-      - nlp.select_pipes(enable=['parser','bunsetu_recognizer']) で実行時も絞る
-      - nlp.pipe(..., n_process, batch_size) で並列＆バッチ処理
-      - 改行/タブは空白1つに正規化、長さ 1..120 のみ返す（従来仕様を踏襲）
-    環境変数:
-      GINZA_N_PROCESS : 並列プロセス数（既定 1）
-      GINZA_BATCH_SIZE: バッチサイズ    （既定 64）
+    GiNZA を用いた文節抽出。
+    - レイアウト分割はせず、テキスト全体をそのまま1本で処理
+    - 句の長さフィルタのみ従来踏襲（1..120）
     """
     ok = HAS_GINZA and (GINZA_NLP is not None)
     if not ok or not isinstance(text, str) or not text:
         return []
-
-    # レイアウト由来のセグメントに分けてからまとめて処理
-    segs = [seg for seg in iter_nlp_segments(text)]
-    if not segs:
-        return []
-
-    # 並列・バッチの設定（必要に応じて環境変数で調整）
-    try:
-        n_process = max(1, int(os.environ.get("GINZA_N_PROCESS", "1")))
-    except Exception:
-        n_process = 1
-    try:
-        batch_size = max(1, int(os.environ.get("GINZA_BATCH_SIZE", "64")))
-    except Exception:
-        batch_size = 64
-
     chunks: list[str] = []
-    # 実行時も 'parser' と 'bunsetu_recognizer' のみに限定して回す（高速化）[4](https://spacy.io/usage/processing-pipelines/)
-    pipes_to_enable = [p for p in GINZA_ENABLED_COMPONENTS if p in GINZA_NLP.pipe_names]
-    with GINZA_NLP.select_pipes(enable=pipes_to_enable):
-        # nlp.pipe による高速ストリーミング処理（並列/バッチ）[4](https://spacy.io/usage/processing-pipelines/)[6](https://spacy.io/api/language/)
-        for doc in GINZA_NLP.pipe(segs, n_process=n_process, batch_size=batch_size):
-            # 文単位に分け、各文の文節Spanを取得（GiNZAの文節API）[5](https://github.com/megagonlabs/ginza/blob/develop/docs/bunsetu_api.md)
-            for sent in doc.sents:
-                for sp in ginza.bunsetu_spans(sent):
-                    s = re.sub(r"[\t\r\n]+", " ", sp.text).strip()
-                    if 1 <= len(s) <= 120:
-                        chunks.append(s)
+    try:
+        pipes_to_enable = [p for p in GINZA_ENABLED_COMPONENTS if p in GINZA_NLP.pipe_names]
+        with GINZA_NLP.select_pipes(enable=pipes_to_enable):
+            for doc in GINZA_NLP.pipe([text], n_process=1, batch_size=1):
+                for sent in doc.sents:
+                    for sp in ginza.bunsetu_spans(sent):
+                        s = re.sub(r"[\t\r\n]+", " ", sp.text).strip()
+                        if 1 <= len(s) <= 120:
+                            chunks.append(s)
+    except Exception:
+        return []
     return chunks
-# ===== 差し替えここまで =====
+# ===== [/REPLACE] =====
 
-# ===== 追加: GiNZA 文章（文）抽出 =====
 def ginza_sentence_units(text: str, *, max_len: int = 300) -> list[str]:
     """
-    レイアウト由来のセグメント毎に GiNZA を流し、doc.sents で文単位に抽出。
-    改行・タブは空白1個に正規化し、1..max_len だけ採用。
-    GiNZA が無い場合は句読点（。！？）ベースの簡易分割でフォールバック。
+    GiNZAで文抽出。GiNZA結果をさらに「。」や「！」で強制分割。
     """
+    import re
     if not isinstance(text, str) or not text:
         return []
 
-    # --- GiNZA あり: spaCy doc.sents で文抽出 ---
+    BULLET_SPLIT_RE = re.compile(r"[●•◆▶■□]+")
+    HEADER_BRACKET_RE = re.compile(r"^【.+?】")
+    UPPER_TITLE_RE = re.compile(r"^[A-Z][A-Z0-9 ()/_-]*$")
+    FORCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])")  # ← 強制分割用
+
+    lines = text.splitlines(keepends=True)
+    pre_chunks = []
+    for ln in lines:
+        if not ln.strip() and ln != "\n":
+            continue
+        had_nl = ln.endswith("\n")
+        body = ln[:-1] if had_nl else ln
+        if HEADER_BRACKET_RE.match(body) or UPPER_TITLE_RE.fullmatch(body):
+            pre_chunks.append(body + ("\n" if had_nl else ""))
+            continue
+        if BULLET_SPLIT_RE.search(body):
+            parts = [p.strip() for p in BULLET_SPLIT_RE.split(body) if p.strip()]
+            for j, p in enumerate(parts):
+                if j == len(parts) - 1 and had_nl:
+                    pre_chunks.append(p + "\n")
+                else:
+                    pre_chunks.append(p)
+        else:
+            pre_chunks.append(body + ("\n" if had_nl else ""))
+
+    out = []
     ok = HAS_GINZA and (GINZA_NLP is not None)
     if ok:
         try:
-            # 実行時も parser / bunsetu_recognizer を有効（parser があれば sents が出ます）
-            pipes_to_enable = [p for p in GINZA_ENABLED_COMPONENTS if p in GINZA_NLP.pipe_names]
-            chunks: list[str] = []
-            segs = [seg for seg in iter_nlp_segments(text)]
-            if not segs:
-                return []
-
-            # 並列・バッチ設定は bunsetsu と揃える
-            try:
-                n_process = max(1, int(os.environ.get("GINZA_N_PROCESS", "1")))
-            except Exception:
-                n_process = 1
-            try:
-                batch_size = max(1, int(os.environ.get("GINZA_BATCH_SIZE", "64")))
-            except Exception:
-                batch_size = 64
-
+            pipes_to_enable = [p for p in ["sentencizer", "parser", "bunsetu_recognizer"] if p in GINZA_NLP.pipe_names]
             with GINZA_NLP.select_pipes(enable=pipes_to_enable):
-                for doc in GINZA_NLP.pipe(segs, n_process=n_process, batch_size=batch_size):
+                for doc in GINZA_NLP.pipe(pre_chunks, n_process=1, batch_size=8):
                     for sent in doc.sents:
-                        s = re.sub(r"[\t\r\n]+", " ", sent.text).strip()
-                        if 1 <= len(s) <= max_len:
-                            chunks.append(s)
-            return chunks
+                        # GiNZA結果をさらに「。」で分割
+                        for part in FORCE_SPLIT_RE.split(sent.text):
+                            part = part.replace("\n", "").strip()
+                            if part and (1 <= len(part) <= max_len):
+                                out.append(part)
         except Exception:
-            # 下のフォールバックへ
+            # フォールバック
+            for chunk in pre_chunks:
+                for s in FORCE_SPLIT_RE.split(chunk):
+                    s = s.replace("\n", "").strip()
+                    if s and (1 <= len(s) <= max_len):
+                        out.append(s)
+    else:
+        # GiNZAなしフォールバック
+        for chunk in pre_chunks:
+            for s in FORCE_SPLIT_RE.split(chunk):
+                s = s.replace("\n", "").strip()
+                if s and (1 <= len(s) <= max_len):
+                    out.append(s)
+    return out
+
+# ===== [ADD] GiNZA 1-pass: 文 + 文節（細切れ）を同時抽出 =====
+from typing import Tuple
+
+def ginza_sentence_and_bunsetsu_onepass(
+    text: str,
+    *,
+    sent_max_len: int = 300
+) -> Tuple[list[str], list[str]]:
+    """
+    GiNZA を 1パスで実行し、同一の Doc から
+      - 文（強制分割あり）
+      - 文節（＋細切れの POS ルール適用）
+    を同時に抽出します。
+    """
+    import re
+    if not isinstance(text, str) or not text:
+        return [], []
+
+    # 既存 ginza_sentence_units の前処理ロジックを移植（ヘッダ/箇条書き対応）
+    BULLET_SPLIT_RE = re.compile(r"[●•◆▶■□]+")
+    HEADER_BRACKET_RE = re.compile(r"^【.+?】")
+    UPPER_TITLE_RE = re.compile(r"^[A-Z][A-Z0-9 \(\)/_\-]*$")
+    FORCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])")  # ← GiNZA文の「。」等で強制分割
+
+    # 行ごとの軽い前処理（既存と同じ）
+    lines = text.splitlines(keepends=True)
+    pre_chunks: list[str] = []
+    for ln in lines:
+        if not ln.strip() and ln != "\n":
+            continue
+        had_nl = ln.endswith("\n")
+        body = ln[:-1] if had_nl else ln
+
+        if HEADER_BRACKET_RE.match(body) or UPPER_TITLE_RE.fullmatch(body):
+            pre_chunks.append(body + ("\n" if had_nl else ""))
+            continue
+
+        if BULLET_SPLIT_RE.search(body):
+            parts = [p.strip() for p in BULLET_SPLIT_RE.split(body) if p.strip()]
+            for j, p in enumerate(parts):
+                if j == len(parts) - 1 and had_nl:
+                    pre_chunks.append(p + "\n")
+                else:
+                    pre_chunks.append(p)
+        else:
+            pre_chunks.append(body + ("\n" if had_nl else ""))
+
+    sentences_out: list[str] = []
+    bunsetsu_out: list[str] = []
+
+    ok = HAS_GINZA and (GINZA_NLP is not None)
+    if ok:
+        try:
+            pipes_to_enable = [p for p in ["sentencizer", "parser", "bunsetu_recognizer"]
+                               if p in GINZA_NLP.pipe_names]
+            with GINZA_NLP.select_pipes(enable=pipes_to_enable):
+                # ★ ここが“1パス”：pre_chunks をまとめて GiNZA に渡し、
+                #   1回のパイプライン内で「文」と「文節」を両方回収します
+                for doc in GINZA_NLP.pipe(pre_chunks, n_process=1, batch_size=8):
+                    for sent in doc.sents:
+                        # --- 文（強制分割） ---
+                        for part in FORCE_SPLIT_RE.split(sent.text):
+                            s = part.replace("\n", "").strip()
+                            if s and (1 <= len(s) <= sent_max_len):
+                                sentences_out.append(s)
+
+                        # --- 文節（＋細切り POS ルール） ---
+                        # 既存 ginza_bunsetsu_fine_pos の方針をインライン適用
+                        for sp in ginza.bunsetu_spans(sent):
+                            text_sp = "".join([t.text_with_ws for t in sp]).strip()
+                            if len(text_sp) <= 15:
+                                s_norm = re.sub(r"[\t\r\n]+", " ", text_sp)
+                                s_norm = re.sub(r"[ ]{2,}", " ", s_norm).strip()
+                                if 1 <= len(s_norm) <= 120:
+                                    bunsetsu_out.append(s_norm)
+                                continue
+
+                            buf: list[str] = []
+
+                            def flush_buf():
+                                nonlocal buf
+                                if not buf:
+                                    return
+                                part = "".join(buf).strip()
+                                if len(part) >= 4:
+                                    s_norm = re.sub(r"[\t\r\n]+", " ", part)
+                                    s_norm = re.sub(r"[ ]{2,}", " ", s_norm).strip()
+                                    if 1 <= len(s_norm) <= 120:
+                                        bunsetsu_out.append(s_norm)
+                                buf.clear()
+
+                            for i, t in enumerate(sp):
+                                buf.append(t.text_with_ws)
+                                next_token = sp[i + 1] if i + 1 < len(sp) else None
+
+                                # 分割条件（長めの文節のみ）
+                                # 助詞/助動詞/PUNCT（、。）の扱いは既存ロジック踏襲
+                                if t.pos_ in {"ADP", "PART"}:
+                                    flush_buf()
+                                elif t.pos_ == "AUX":
+                                    if not next_token or next_token.pos_ != "AUX":
+                                        flush_buf()
+                                elif t.pos_ == "PUNCT" and t.text in {"、", "。"}:
+                                    flush_buf()
+
+                            if buf:
+                                flush_buf()
+        except Exception:
+            # 失敗時は後述の MeCab フォールバックへ
             pass
 
-    # --- フォールバック（GiNZA なし／失敗時）: 句読点ベースの簡易文分割 ---
-    out: list[str] = []
-    for seg in iter_nlp_segments(text):
-        for s in re.split(r"(?<=[。！？!?.])\s*", seg):
-            s = re.sub(r"[\t\r\n]+", " ", s).strip()
-            if 1 <= len(s) <= max_len:
-                out.append(s)
-    return out
-# ===== 追加ここまで =====
+    # GiNZAが無い/失敗時のフォールバック（従来どおり簡易）
+    if not sentences_out and not bunsetsu_out:
+        import re
+        FORCE_SPLIT_RE = re.compile(r"(?<=[。！？!?])")
+        # 文（簡易）
+        for s in FORCE_SPLIT_RE.split(text):
+            s2 = s.replace("\n", "").strip()
+            if s2 and (1 <= len(s2) <= sent_max_len):
+                sentences_out.append(s2)
+        # 文節（MeCab既存）
+        try:
+            bunsetsu_out = mecab_bunsetsu_chunks(text)
+        except Exception:
+            bunsetsu_out = []
+
+    return sentences_out, bunsetsu_out
+
+# ===== [ADD] 抽出（1パス版）：ページごとに文 + 文節を同時カウント =====
+from typing import Tuple
+
+def extract_candidates_sentence_bunsetsu_onepass(
+    pages: List[PageData],
+    *,
+    bun_min_len: int = 1,
+    bun_max_len: int = 120,
+    sent_min_len: int = 1,
+    sent_max_len: int = 300,
+    min_count: int = 1,
+    top_k: int = 0
+) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """
+    ページ配列から、GiNZA 1パスで「文＋文節」を同時抽出してカウント。
+    従来の「数字だけ除外（時間/日付は残す）」も適用して返します。
+    """
+    import re
+    cnt_b = Counter()
+    cnt_s = Counter()
+
+    # 既存の「数字だけ」・時間/日付判定をそのまま利用
+    try:
+        NUM_RE = _NUM_ONLY_LINE_RE
+    except NameError:
+        NUM_DIG = r"[0-9\uFF10-\uFF19]"
+        GROUP_SEP = r"[,\uFF0C \u00A0\u3000]"
+        DEC_SEP = r"[.\uFF0E]"
+        NUM_RE = re.compile(
+            rf"""
+            ^{NUM_DIG}+                         # 先頭の数字列
+            (?:{GROUP_SEP}{NUM_DIG}{{3}})*      # 千区切りは3桁固定で繰り返し
+            (?:{DEC_SEP}{NUM_DIG}+)?            # 小数部（任意）
+            $""",
+            re.VERBOSE
+        )
+    DATE_RE = re.compile(r"^\s*\d{4}[\-/]\d{1,2}[\-/]\d{1,2}\s*$")
+
+    for p in pages:
+        # 保存（解析ログ用）
+        try:
+            save_nlp_input("ginza_onepass", p.text_join, suffix=f"{p.pdf}_p{p.page}")
+        except Exception:
+            pass
+
+        sents, buns = ginza_sentence_and_bunsetsu_onepass(
+            p.text_join, sent_max_len=sent_max_len
+        )
+
+        # ★ 文節フィルタ用ヘルパー（関数内に追加）
+        def _is_single_symbol_1char(s: str) -> bool:
+            """記号/句読点だけ1文字（Unicodeカテゴリ 'P*' or 'S*'）なら True"""
+            if not isinstance(s, str):
+                return False
+            t = s.strip()
+            if len(t) != 1:
+                return False
+            cat = unicodedata.category(t[0])  # 'P*' 句読点, 'S*' 記号
+            return cat.startswith('P') or cat.startswith('S')
+
+        def _is_single_alpha_1char(s: str) -> bool:
+            """アルファベットだけ1文字（全角含む。NFKCでASCII化して判定）なら True"""
+            try:
+                # プロジェクト内の nfkc がある前提（なければ unicodedata.normalize で代用可能）
+                t = nfkc(s.strip())
+            except NameError:
+                from unicodedata import normalize
+                t = normalize('NFKC', s.strip())
+            return len(t) == 1 and (('A' <= t <= 'Z') or ('a' <= t <= 'z'))
+
+        # --- 文：数字だけ除外 ---
+        for s in sents:
+            t = strip_leading_control_chars(s).strip()
+            if not t:
+                continue
+            if NUM_RE.fullmatch(t):
+                continue
+            if _is_single_symbol_1char(t) or _is_single_alpha_1char(t):
+                continue
+            if sent_min_len <= len(t) <= sent_max_len:
+                cnt_s[t] += 1
+
+        # ーーー 文節の集計ループ（差し替え）ーーー
+        for ch in buns:
+            ch2 = strip_leading_control_chars(ch).strip()
+            if not ch2:
+                continue
+
+            # ✅ sentence と同じ「数字だけ除外」ただし 時間/日付 は残す
+            if NUM_RE.fullmatch(ch2):
+                continue
+
+            # ✅ 追加除外：記号だけ1文字／アルファベットだけ1文字
+            if _is_single_symbol_1char(ch2) or _is_single_alpha_1char(ch2):
+                continue
+
+            # 既存の長さ条件
+            if bun_min_len <= len(ch2) <= bun_max_len:
+                cnt_b[ch2] += 1
+
+
+    arr_b = [(w, c) for w, c in cnt_b.items() if c >= min_count]
+    arr_s = [(w, c) for w, c in cnt_s.items() if c >= min_count]
+    arr_b.sort(key=lambda x: (-x[1], x[0]))
+    arr_s.sort(key=lambda x: (-x[1], x[0]))
+
+    if top_k and top_k > 0:
+        arr_b = arr_b[:top_k]
+        arr_s = arr_s[:top_k]
+    return arr_b, arr_s
+
+
 
 # ------------------------------------------------------------
 # MeCab helpers
@@ -1471,18 +2174,15 @@ def phrase_reading_norm_cached(s: str) -> str:
     return v
 # ===== 読みキャッシュ ここまで =====
 
-# === [NEW] 長音「ー」を保持する読み（骨格） ================================
+# ===== [ADD] 長音あり読み（keepchoon）のキャッシュ =====
+READ_NORM_KEEP_CACHE: Dict[str, str] = {}
 
-def phrase_reading_norm_keepchoon(s: str) -> str:
-    """
-    文字列 s の '読み（骨格）' を生成するが、長音「ー」を保持する版。
-    - ひらがな→カタカナ
-    - カタカナ以外を除去
-    - 長音「ー」は残す（drop_choon=False）
-    MeCab があれば各語の reading を使い、なければ表層の簡易変換でフォールバック。
-    """
+def phrase_reading_norm_keepchoon_cached(s: str) -> str:
     if not isinstance(s, str) or not s:
         return ""
+    v = READ_NORM_KEEP_CACHE.get(s)
+    if v is not None:
+        return v
     ok, _ = ensure_mecab()
     if ok and MECAB_TAGGER is not None:
         toks = tokenize_mecab(s, MECAB_TAGGER)
@@ -1491,10 +2191,31 @@ def phrase_reading_norm_keepchoon(s: str) -> str:
             r = reading or hira_to_kata(nfkc(surf))
             parts.append(r)
         joined = "".join(parts)
-        return normalize_kana(joined, drop_choon=False)
-    # fallback: NFKC → カタカナ化 → カタカナ以外除去（長音は残す）
-    return normalize_kana(hira_to_kata(nfkc(s or "")), drop_choon=False)
+        v = normalize_kana(joined, drop_choon=False)
+    else:
+        v = normalize_kana(hira_to_kata(nfkc(s or "")), drop_choon=False)
+    READ_NORM_KEEP_CACHE[s] = v
+    return v
 
+# ===== [ADD] 読みキャッシュの一括プリウォーム =====
+def prewarm_reading_caches(surfaces: List[str], *, keepchoon: bool = True):
+    """MeCab を使う前に、表層群の '読み' を一括生成してキャッシュに載せる。"""
+    if not surfaces:
+        return
+    uniq = sorted({s for s in surfaces if isinstance(s, str) and s})
+    ok, _ = ensure_mecab()
+    if not ok or MECAB_TAGGER is None:
+        # MeCab 無しでもフォールバックを通す（コストは軽い）
+        for s in uniq:
+            _ = phrase_reading_norm_cached(s)
+            if keepchoon:
+                _ = phrase_reading_norm_keepchoon_cached(s)
+        return
+    # MeCab あり：1語ずつでOK（Taggerは内部でキャッシュされる）
+    for s in uniq:
+        _ = phrase_reading_norm_cached(s)              # 長音なし骨格
+        if keepchoon:
+            _ = phrase_reading_norm_keepchoon_cached(s)  # 長音あり骨格
 
 # ------------------------------------------------------------
 # Token抽出（正規表現ベース, MeCabなしフォールバック用）
@@ -1515,6 +2236,7 @@ def extract_candidates_regex(pages: List[PageData], min_len=1, max_len=120, min_
 # ------------------------------------------------------------
 
 # ===== （任意）置き換え: 複合語もセグメント単位で =====
+# ===== [REPLACE] MeCab 複合語（全文一発） =====
 def mecab_compound_tokens_alljoin(text: str) -> List[str]:
     ok, msg = ensure_mecab()
     if not ok:
@@ -1523,69 +2245,82 @@ def mecab_compound_tokens_alljoin(text: str) -> List[str]:
         return []
 
     out: List[str] = []
+    toks = tokenize_mecab(text, MECAB_TAGGER)
 
-    def worker(seg: str):
-        toks = tokenize_mecab(seg, MECAB_TAGGER)
-        parts: List[str] = []
+    parts: List[str] = []
+    has_conn = False
+    prev_type: Optional[str] = None
+
+    def flush_local():
+        nonlocal parts, has_conn, prev_type
+        if parts and has_conn:
+            token = "".join(parts)
+            if 1 <= len(token) <= 120:
+                out.append(token)
+        parts = []
         has_conn = False
-        prev_type: Optional[str] = None
+        prev_type = None
 
-        def flush_local():
-            nonlocal parts, has_conn, prev_type
-            if parts and has_conn:
-                token = "".join(parts)
-                if 1 <= len(token) <= 120:
-                    out.append(token)
-            parts = []
-            has_conn = False
-            prev_type = None
+    for surf, pos1, lemma, reading, ct, cf in toks:
+        if not surf:
+            continue
+        is_word = pos1.startswith(("名詞", "動詞", "形容詞", "助動詞"))
+        is_conn = surf and all(ch in CONNECT_CHARS for ch in surf)
 
-        for surf, pos1, lemma, reading, ct, cf in toks:
-            if not surf:
-                continue
-            is_word = pos1.startswith(("名詞", "動詞", "形容詞", "助動詞"))
-            is_conn = surf and all(ch in CONNECT_CHARS for ch in surf)
+        if is_conn:
+            if parts and prev_type == 'word':
+                parts.append(surf)
+                has_conn = True
+                prev_type = 'conn'
+            continue
 
-            if is_conn:
-                if parts and prev_type == 'word':
-                    parts.append(surf); has_conn = True; prev_type = 'conn'
-                continue
-            elif is_word:
-                if not parts:
-                    parts = [surf]; prev_type = 'word'
-                else:
-                    if prev_type == 'conn':
-                        parts.append(surf); prev_type = 'word'
-                    else:
-                        flush_local()
-                        parts = [surf]; prev_type = 'word'
+        if is_word:
+            if not parts:
+                parts = [surf]
+                prev_type = 'word'
             else:
-                flush_local()
+                if prev_type == 'conn':
+                    parts.append(surf)
+                    prev_type = 'word'
+                else:
+                    flush_local()
+                    parts = [surf]
+                    prev_type = 'word'
+        else:
+            flush_local()
 
-        flush_local()
-
-    for seg in iter_nlp_segments(text):
-        worker(seg)
-
+    flush_local()
     return out
+# ===== [/REPLACE] =====
 
+# ===== [REPLACE] 複合語候補抽出：MeCab 投入直前のテキストを保存 =====
 def extract_candidates_compound_alljoin(
     pages: List[PageData], min_len=1, max_len=120, min_count=1, top_k=0, use_mecab=True
 ):
     if use_mecab and HAS_MECAB:
         cnt = Counter()
         for p in pages:
+            # ★ 投げる直前のテキストを保存
+            try:
+                save_nlp_input("mecab_compound", p.text_join, suffix=f"{p.pdf}_p{p.page}")
+            except Exception:
+                pass
+
             for w in mecab_compound_tokens_alljoin(p.text_join):
-                w = strip_leading_control_chars(w)  # ★追加
+                w = strip_leading_control_chars(w)  # 既存処理
                 if not w:
                     continue
                 if min_len <= len(w) <= max_len:
                     cnt[w] += 1
+
         arr = [(w, c) for w, c in cnt.items() if c >= min_count]
         arr.sort(key=lambda x: (-x[1], x[0]))
         return arr if (not top_k or top_k <= 0) else arr[:top_k]
     else:
+        # MeCab なしのフォールバック（保存は不要）
         return extract_candidates_regex(pages, min_len=min_len, max_len=max_len, min_count=min_count)
+# ===== [/REPLACE] =====
+
 
 # ------------------------------------------------------------
 # 文節抽出（簡易ルール）
@@ -1593,6 +2328,7 @@ def extract_candidates_compound_alljoin(
 PUNCT_SET = set('。、．，!.！？？」』〕）】]〉》"\\\'\')')
 
 # ===== 置き換え: MeCab 文節（セグメント単位 + 改行/タブの空白化） =====
+# ===== [REPLACE] MeCab 文節（全文一発） =====
 def mecab_bunsetsu_chunks(text: str) -> List[str]:
     ok, msg = ensure_mecab()
     if not ok:
@@ -1606,49 +2342,218 @@ def mecab_bunsetsu_chunks(text: str) -> List[str]:
         if not cur:
             return
         s = "".join(cur)
-        # 改行・タブは空白に、連続空白は 1 個に
+        # 改行・タブは空白に正規化
         s = re.sub(r"[\t\r\n]+", " ", s)
         s = re.sub(r"[ ]{2,}", " ", s).strip()
         if 1 <= len(s) <= 120:
             chunks.append(s)
         cur.clear()
 
-    # ★ 重要：セグメント単位に MeCab を回す
-    for seg in iter_nlp_segments(text):
-        toks = tokenize_mecab(seg, MECAB_TAGGER)
-        cur: List[str] = []
-        for surf, pos1, lemma, reading, ct, cf in toks:
-            if not surf:
-                continue
-            # 句読点などの記号で文節を打ち切り
-            if surf in PUNCT_SET or pos1.startswith("記号"):
-                flush(cur)
-                continue
+    toks = tokenize_mecab(text, MECAB_TAGGER)
+    cur: List[str] = []
+    for surf, pos1, lemma, reading, ct, cf in toks:
+        if not surf:
+            continue
+        # 句読点などの記号で文節を打ち切り
+        if surf in PUNCT_SET or pos1.startswith("記号"):
+            flush(cur)
+            continue
+        cur.append(surf)
+        # 助詞・助動詞の直後で文節を区切る（従来ルール）
+        if pos1 in ("助詞", "助動詞"):
+            flush(cur)
 
-            cur.append(surf)
-            # 助詞・助動詞の直後で文節を区切る（元のロジック）
-            if pos1 in ("助詞", "助動詞"):
-                flush(cur)
+    flush(cur)
+    return chunks
+# ===== [/REPLACE] =====
 
-        flush(cur)  # セグメント終端で flush
+def ginza_bunsetsu_fine_pos(sentences: list[str]) -> list[str]:
+    if not sentences or not HAS_GINZA or GINZA_NLP is None:
+        return []
+    chunks: list[str] = []
+    try:
+        pipes_to_enable = [p for p in ["parser", "bunsetu_recognizer"] if p in GINZA_NLP.pipe_names]
+        with GINZA_NLP.select_pipes(enable=pipes_to_enable):
+            for doc in GINZA_NLP.pipe(sentences, n_process=1, batch_size=8):
+                for sent in doc.sents:
+                    for sp in ginza.bunsetu_spans(sent):
+                        # ★ ここ：空白を保持して文節テキスト化
+                        text = "".join(t.text_with_ws for t in sp).strip()
+                        if len(text) <= 15:
+                            chunks.append(text)
+                            continue
+
+                        # 長めの文節のみ細切り
+                        buf: list[str] = []
+                        for i, t in enumerate(sp):
+                            # ★ ここ：細切りバッファも空白保持で積む
+                            buf.append(t.text_with_ws)
+                            next_token = sp[i + 1] if i + 1 < len(sp) else None
+
+                            if t.pos_ in {"ADP", "PART"}:
+                                part = "".join(buf).strip()
+                                if len(part) >= 4:
+                                    chunks.append(part)
+                                buf.clear()
+                            elif t.pos_ == "AUX":
+                                if not next_token or next_token.pos_ != "AUX":
+                                    part = "".join(buf).strip()
+                                    if len(part) >= 4:
+                                        chunks.append(part)
+                                    buf.clear()
+                            elif t.pos_ == "PUNCT" and t.text in {"、", "。"}:
+                                part = "".join(buf).strip()
+                                if len(part) >= 4:
+                                    chunks.append(part)
+                                buf.clear()
+
+                        if buf:
+                            part = "".join(buf).strip()
+                            if len(part) >= 4:
+                                chunks.append(part)
+    except Exception:
+        return []
     return chunks
 
-def extract_candidates_bunsetsu(
-    pages: List[PageData], min_len=1, max_len=120, min_count=1, top_k=0
-) -> List[Tuple[str,int]]:
-    cnt = Counter()
-    # GiNZA があれば最優先、なければ従来の簡易ルール
-    for p in pages:
-        chunks = ginza_bunsetsu_chunks(p.text_join) if HAS_GINZA else mecab_bunsetsu_chunks(p.text_join)
-        for ch in chunks:
-            ch = strip_leading_control_chars(ch)
-            if ch and (min_len <= len(ch) <= max_len):
-                cnt[ch] += 1
-    arr = [(w, c) for w, c in cnt.items() if c >= min_count]
-    arr.sort(key=lambda x: (-x[1], x[0]))
-    return arr if (not top_k or top_k <= 0) else arr[:top_k]
 
-# ===== 追加: 文章（文）候補抽出 =====
+# ===== [PATCH] bunsetsu と sentence を同時に返せるように拡張 =====
+from typing import Union
+
+def extract_candidates_bunsetsu(
+    pages: List[PageData],
+    min_len=1,
+    max_len=120,
+    min_count=1,
+    top_k=0,
+    *,
+    also_sentence: bool = False,       # ← 追加: 文も一緒にカウントするか
+    sent_max_len: int = 300            # ← 追加: 文の最大長
+) -> Union[List[Tuple[str,int]], Tuple[List[Tuple[str,int]], List[Tuple[str,int]]]]:
+    cnt_b = Counter()
+    cnt_s = Counter() if also_sentence else None
+
+    import re
+    try:
+        NUM_RE = _NUM_ONLY_LINE_RE
+    except NameError:
+        NUM_RE = re.compile(r"^[\+\-]?\d[\d\s,./:\-–—]*$")
+
+    TIME_RE  = re.compile(r"""
+        ^\s*
+        \d{1,2} [:：] \d{2} (?: [:：] \d{2} )?
+        (?: \s* (?:〜|~|\- |–|—) \s*
+            \d{1,2} [:：] \d{2} (?: [:：] \d{2} )?
+        )?
+        \s*$
+    """, re.VERBOSE)
+    DATE_RE  = re.compile(r"^\s*\d{4}[\-/]\d{1,2}[\-/]\d{1,2}\s*$")
+
+    def is_time_or_date_like_line(t: str) -> bool:
+        s = strip_leading_control_chars(t).strip()
+        if not s:
+            return False
+        if any(u in s for u in ("時","分","秒")):
+            return True
+        return bool(TIME_RE.fullmatch(s) or DATE_RE.fullmatch(s))
+
+    for p in pages:
+        # 既存の保存（変更なし）
+        try:
+            kind = "ginza_bunsetsu_posfine" if HAS_GINZA else "mecab_bunsetsu"
+            save_nlp_input(kind, p.text_join, suffix=f"{p.pdf}_p{p.page}")
+        except Exception:
+            pass
+
+        if HAS_GINZA:
+            sentences = ginza_sentence_units(p.text_join, max_len=sent_max_len)
+            sents_filtered = []
+            for s in sentences:
+                t = strip_leading_control_chars(s).strip()
+                if not t:
+                    continue
+                if NUM_RE.fullmatch(t) and not is_time_or_date_like_line(t):
+                    continue
+                sents_filtered.append(t)
+
+            # ★ 追加：ここで「文」を同時にカウント
+            if also_sentence:
+                for s in sents_filtered:
+                    if 1 <= len(s) <= sent_max_len:
+                        cnt_s[s] += 1
+
+            # 文節へ（既存）
+            chunks = ginza_bunsetsu_fine_pos(sents_filtered)
+        else:
+            # MeCab フォールバック（既存）
+            lines = p.text_join.splitlines()
+            clean_lines = []
+            for ln in lines:
+                t = strip_leading_control_chars(ln).strip()
+                if t and NUM_RE.fullmatch(t) and not is_time_or_date_like_line(t):
+                    continue
+                clean_lines.append(ln)
+            clean_text = "\n".join(clean_lines)
+            chunks = mecab_bunsetsu_chunks(clean_text)
+
+        # --- ここから追加（関数内の集計ループ直前に置く） ---
+        import unicodedata
+
+        def _is_single_symbol_1char(s: str) -> bool:
+            """記号/句読点だけ1文字（Unicodeカテゴリ 'S*' or 'P*'）なら True"""
+            if not isinstance(s, str):
+                return False
+            t = s.strip()
+            if len(t) != 1:
+                return False
+            cat = unicodedata.category(t[0])  # 'P*' 句読点, 'S*' 記号
+            return cat.startswith('P') or cat.startswith('S')
+
+        def _is_single_alpha_1char(s: str) -> bool:
+            """アルファベットだけ1文字（全角含む/NFKCでASCII化して判定）なら True"""
+            if not isinstance(s, str):
+                return False
+            t = nfkc(s.strip())  # ← 既存の nfkc を利用
+            return len(t) == 1 and (('A' <= t <= 'Z') or ('a' <= t <= 'z'))
+        # --- ここまで追加 ---
+
+        # --- 既存の「集計（既存）」からこの for ループを差し替え ---
+        for ch in chunks:
+            # 既存の前処理（制御文字などを剥がす）
+            ch2 = strip_leading_control_chars(ch).strip()
+            if not ch2:
+                continue
+
+            # ✅ sentence と同様の「数字だけ行」の除外（ただし時間/日付は残す）
+            #    NUM_RE と is_time_or_date_like_line は関数冒頭で既に用意済み
+            if NUM_RE.fullmatch(ch2) and not is_time_or_date_like_line(ch2):
+                continue
+
+            # ✅ 追加フィルタ：
+            #  - 記号だけ1文字 … 句読点/記号カテゴリ（'P*'/'S*'）を1文字で除外
+            #  - アルファベットだけ1文字 … NFKC 正規化して ASCII 英字1文字を除外（全角も対象）
+            if _is_single_symbol_1char(ch2) or _is_single_alpha_1char(ch2):
+                continue
+
+            # 文字数の範囲（既存）
+            if min_len <= len(ch2) <= max_len:
+                cnt_b[ch2] += 1
+        # --- 差し替えここまで ---
+
+
+    arr_b = [(w, c) for w, c in cnt_b.items() if c >= min_count]
+    arr_b.sort(key=lambda x: (-x[1], x[0]))
+
+    if also_sentence:
+        arr_s = [(w, c) for w, c in cnt_s.items() if c >= min_count]
+        # 文は 文字数の制約が別なので並べ替えだけ
+        arr_s.sort(key=lambda x: (-x[1], x[0]))
+        return (arr_b if (not top_k or top_k <= 0) else arr_b[:top_k],
+                arr_s if (not top_k or top_k <= 0) else arr_s[:top_k])
+    else:
+        return arr_b if (not top_k or top_k <= 0) else arr_b[:top_k]
+
+
+# ===== [REPLACE] 文章（文）候補抽出：投入直前のテキストを保存 =====
 def extract_candidates_sentence(
     pages: List[PageData],
     min_len: int = 1,
@@ -1658,15 +2563,68 @@ def extract_candidates_sentence(
 ) -> List[Tuple[str, int]]:
     cnt = Counter()
     for p in pages:
-        # GiNZA 優先、無ければ簡易フォールバック
+        # ★ 投げる直前のテキストを保存
+        try:
+            kind = "ginza_sentence" if HAS_GINZA else "simple_sentence"
+            save_nlp_input(kind, p.text_join, suffix=f"{p.pdf}_p{p.page}")
+        except Exception:
+            pass
+
         sents = ginza_sentence_units(p.text_join, max_len=max_len) if HAS_GINZA else ginza_sentence_units(p.text_join, max_len=max_len)
+
+        # --- 追加: 時間/日付っぽい行の例外判定 ---
+        import re
+        try:
+            NUM_RE = _NUM_ONLY_LINE_RE  # 既存の「数字だけ」判定
+        except NameError:
+            NUM_RE = re.compile(r"^[\+\-]?\d[\d\s,./:\-–—]*$")
+
+        # 時間表記: HH:MM, HH:MM:SS（半角/全角コロン）, レンジ（〜, -, –, —）
+        TIME_RE = re.compile(
+            r"""
+            ^\s*
+            \d{1,2} [:\：] \d{2}            # HH:MM
+            (?: [:\：] \d{2} )?             # optional :SS
+            (?: \s* (?:〜|~|-|–|—) \s*      # optional range delimiter
+                \d{1,2} [:\：] \d{2}
+                (?: [:\：] \d{2} )?
+            )?
+            \s*$
+            """,
+            re.VERBOSE,
+        )
+        # 日付表記: YYYY-MM-DD / YYYY/MM/DD
+        DATE_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*$")
+
+        def is_time_or_date_like_line(t: str) -> bool:
+            s = strip_leading_control_chars(t).strip()
+            if not s:
+                return False
+            # 日本語の時間単位が含まれるなら時間扱い（12時34分、30秒 等）
+            if any(u in s for u in ("時", "分", "秒")):
+                return True
+            # HH:MM(:SS)/レンジ or YYYY-MM-DD(／)
+            return bool(TIME_RE.fullmatch(s) or DATE_RE.fullmatch(s))
+
+        # 数字だけは除外。ただし「時間・日付」は残す
+        filtered = []
         for s in sents:
-            s = strip_leading_control_chars(s)
+            t = strip_leading_control_chars(s).strip()
+            if not t:
+                continue
+            if NUM_RE.fullmatch(t) and not is_time_or_date_like_line(t):
+                # 「数字だけ」行で、時間・日付のどちらにも該当しない → 除外
+                continue
+            filtered.append(t)
+
+        for s in filtered:
             if s and (min_len <= len(s) <= max_len):
                 cnt[s] += 1
+
     arr = [(w, c) for w, c in cnt.items() if c >= min_count]
     arr.sort(key=lambda x: (-x[1], x[0]))
     return arr if (not top_k or top_k <= 0) else arr[:top_k]
+# ===== [/REPLACE] =====
 
 
 # ------------------------------------------------------------
@@ -1932,10 +2890,12 @@ def numeric_only_label(a: str, b: str) -> str:
 # ------------------------------------------------------------
 # Lexical（細粒度）語彙とペア
 # ------------------------------------------------------------
+# ===== [REPLACE] 語彙構築：MeCab 投入直前のテキストを保存 =====
 def collect_lexicon_general(pages: List[PageData], top_k=4000, min_count=1) -> pd.DataFrame:
     ok, msg = ensure_mecab()
     if not ok:
         raise RuntimeError(msg)
+
     counts = Counter()
     readings_map: Dict[str, Counter] = defaultdict(Counter)
     lemma_map: Dict[str, Counter] = defaultdict(Counter)
@@ -1943,6 +2903,12 @@ def collect_lexicon_general(pages: List[PageData], top_k=4000, min_count=1) -> p
     pos_map: Dict[str, Counter] = defaultdict(Counter)
 
     for p in pages:
+        # ★ 投げる直前のテキストを保存
+        try:
+            save_nlp_input("mecab_lexicon", p.text_join, suffix=f"{p.pdf}_p{p.page}")
+        except Exception:
+            pass
+
         for surf, pos1, lemma, reading, ct, cf in tokenize_mecab(p.text_join, MECAB_TAGGER):
             if not pos1.startswith(("名詞", "動詞", "形容詞", "助動詞")):
                 continue
@@ -1977,6 +2943,8 @@ def collect_lexicon_general(pages: List[PageData], top_k=4000, min_count=1) -> p
             "pos1": top1(pos_map[s]),
         })
     return pd.DataFrame(rows)
+# ===== [/REPLACE] =====
+
 
 # ===== [REPLACE] build_synonym_pairs_general: 語彙を「名詞」「助・動詞」に分離 =====
 def build_synonym_pairs_general(
@@ -3349,46 +4317,64 @@ class AnalyzerWorker(QObject):
                 self.progress_text.emit(f"{label}中…")
         return cb
 
+    # ===== [REPLACE] AnalyzerWorker.run（1パス時間比に最適化した進捗配分） =====
     def run(self):
         try:
-            # 0〜10%: PDF抽出
+            # ------------------------------------------------------------------
+            # 0) PDF抽出 0–12%
+            # ------------------------------------------------------------------
             pages = []
             n_files = max(1, len(self.files))
             for i, f in enumerate(self.files, 1):
                 self.progress_text.emit("PDF抽出中…")
-                pages += extract_pages(f)
-                self._emit(int(10 * i / n_files))
+                # 縦ページの忠実復元（strict_y）＆ NLP 用フラット化あり
+                pages += extract_pages(f, flatten_for_nlp=True, v_strategy="strict_y")
+                self._emit(int(12 * i / n_files))
             if not pages:
                 raise RuntimeError("PDFからテキストが取得できませんでした。")
 
-            # 12%: 細粒度トークン収集（参照）
+            # ------------------------------------------------------------------
+            # 1) 細粒度トークン参照 / 語彙構築 12–20%
+            # ------------------------------------------------------------------
             self.progress_text.emit("細粒度トークン収集（参照）中…")
             if self.use_mecab and HAS_MECAB:
-                tokens_fine = extract_candidates_regex(pages, self.min_len, self.max_len, self.min_count_lex)
-                self._emit(12)
-                # 15%: 語彙構築
-                self.progress_text.emit("細粒度語彙の構築中…")
-                df_lex = collect_lexicon_general(pages, top_k=self.top_k_lex, min_count=self.min_count_lex)
-                self._emit(15)
-                # 15〜25%: 細粒度ペア生成
-                df_pairs_lex_general = build_synonym_pairs_general(
-                    df_lex, read_sim_th=self.read_th, char_sim_th=self.char_th, scope="語彙",
-                    progress_cb=self._subprogress_factory(15, 25, "細粒度ペア生成")
+                tokens_fine = extract_candidates_regex(
+                    pages, self.min_len, self.max_len, self.min_count_lex
                 )
             else:
                 raise RuntimeError("MeCab (fugashi/unidic-lite) が必要です。")
+            self._emit(16)  # 参照トークン終了の目安
 
-            # 27%: 複合語候補（メイン）
+            self.progress_text.emit("細粒度語彙の構築中…")
+            df_lex = collect_lexicon_general(
+                pages, top_k=self.top_k_lex, min_count=self.min_count_lex
+            )
+            self._emit(20)
+
+            # ------------------------------------------------------------------
+            # 2) 細粒度ペア生成（語彙ペア）20–45%
+            # ------------------------------------------------------------------
+            df_pairs_lex_general = build_synonym_pairs_general(
+                df_lex,
+                read_sim_th=self.read_th,
+                char_sim_th=self.char_th,
+                scope="語彙",
+                progress_cb=self._subprogress_factory(20, 45, "細粒度ペア生成"),
+            )
+
+            # ------------------------------------------------------------------
+            # 3) 複合語候補抽出 45–55%
+            # ------------------------------------------------------------------
+            self.progress_text.emit("複合語候補抽出中…")
             tokens_compound_main = extract_candidates_compound_alljoin(
-                pages, min_len=self.min_len, max_len=self.max_len,
+                pages,
+                min_len=self.min_len, max_len=self.max_len,
                 min_count=self.min_count_lex, top_k=0, use_mecab=True
             )
-            self._emit(27)
-
-            # 補助（MeCabなし）もマージ
-            self.progress_text.emit("複合語候補抽出中…")
+            # MeCabなしフォールバックもマージ
             tokens_compound_fb = extract_candidates_compound_alljoin(
-                pages, min_len=self.min_len, max_len=self.max_len,
+                pages,
+                min_len=self.min_len, max_len=self.max_len,
                 min_count=self.min_count_lex, top_k=0, use_mecab=False
             )
             c_all = Counter()
@@ -3397,108 +4383,111 @@ class AnalyzerWorker(QObject):
             for w, c in tokens_compound_fb:
                 c_all[w] += c
             tokens_compound = sorted(c_all.items(), key=lambda x: (-x[1], x[0]))
+            self._emit(55)
 
-            # 28〜55%: 複合語ペア生成
+            # ------------------------------------------------------------------
+            # 4) 複合語ペア生成 55–78%
+            # ------------------------------------------------------------------
             df_pairs_compound = build_synonym_pairs_char_only(
                 tokens_compound,
-                char_sim_th=self.char_th,            # ← 固定0.90を外すのがオススメ
+                char_sim_th=self.char_th,
                 top_k=self.top_k_lex, scope="複合語",
-                progress_cb=self._subprogress_factory(28, 55, "複合語ペア生成"),
-                read_sim_th=self.read_th             # ← 追加：読みもしきい値で判定
+                progress_cb=self._subprogress_factory(55, 78, "複合語ペア生成"),
+                read_sim_th=self.read_th,    # 読みもしきい値で判定
             )
 
-            # 57%: 文節候補抽出
-            self.progress_text.emit("文節候補抽出中…")
-            tokens_bunsetsu = extract_candidates_bunsetsu(
-                pages, min_len=self.min_len, max_len=self.max_len,
+            # ------------------------------------------------------------------
+            # 5) 文・文節候補抽出（GiNZA 1パス）78–83%
+            # ------------------------------------------------------------------
+            self.progress_text.emit("文・文節候補抽出中…")
+            tokens_bunsetsu, tokens_sentence = extract_candidates_sentence_bunsetsu_onepass(
+                pages,
+                bun_min_len=self.min_len, bun_max_len=self.max_len,
+                sent_min_len=self.min_len, sent_max_len=max(self.max_len, 300),
                 min_count=self.min_count_lex, top_k=0
             )
-            self._emit(57)
+            self._emit(83)
 
-            # 58〜80%: 文節ペア生成
+            # ------------------------------------------------------------------
+            # 6) 文節ペア生成 83–92%
+            # ------------------------------------------------------------------
             df_pairs_bunsetsu = build_synonym_pairs_char_only(
                 tokens_bunsetsu,
-                char_sim_th=self.char_th,            # ← 同上
+                char_sim_th=self.char_th,
                 top_k=self.top_k_lex, scope="文節",
-                progress_cb=self._subprogress_factory(58, 80, "文節ペア生成"),
-                read_sim_th=self.read_th             # ← 追加
+                progress_cb=self._subprogress_factory(83, 92, "文節ペア生成"),
+                read_sim_th=self.read_th
             )
 
-            # ===== 挿入: 文章（文）候補抽出 → ペア生成 =====
-            # 80%: 文章候補抽出
-            self.progress_text.emit("文章候補抽出中…")
-            tokens_sentence = extract_candidates_sentence(
-                pages, min_len=self.min_len, max_len=max(self.max_len, 300),  # 文は少し長めも許容
-                min_count=self.min_count_lex, top_k=0
-            )
-            self._emit(80)
-
-            # 81〜88%: 文章ペア生成
+            # ------------------------------------------------------------------
+            # 7) 文章ペア生成 92–97%
+            # ------------------------------------------------------------------
             df_pairs_sentence = build_synonym_pairs_char_only(
                 tokens_sentence,
                 char_sim_th=self.char_th,
-                top_k=self.top_k_lex,
-                scope="文章",
-                progress_cb=self._subprogress_factory(81, 88, "文章ペア生成"),
-                read_sim_th=self.read_th  # 読みもしきい値で判定（bunsetsu と同様）
+                top_k=self.top_k_lex, scope="文章",
+                progress_cb=self._subprogress_factory(92, 97, "文章ペア生成"),
+                read_sim_th=self.read_th
             )
 
-            # ===== 差し替え: 統合（文章を追加） =====
-            # 88%: 統合
+            # ------------------------------------------------------------------
+            # 8) 統合・再採点・仕上げ 97–100%
+            # ------------------------------------------------------------------
             self.progress_text.emit("候補統合中…")
-            df_unified = unify_pairs(df_pairs_lex_general, df_pairs_compound, df_pairs_bunsetsu, df_pairs_sentence)
-            self._emit(88)
-            # ===== 差し替えここまで =====
+            df_unified = unify_pairs(
+                df_pairs_lex_general, df_pairs_compound, df_pairs_bunsetsu, df_pairs_sentence
+            )
+            self._emit(97)
 
-            # 88.5%: 読み系（lemma/inflect/reading...）を再採点（既存）
+            # === [ADD] 読みキャッシュのプリウォーム ===
+            surfaces = []
+            if not df_unified.empty and {"a", "b"}.issubset(df_unified.columns):
+                surfaces = pd.unique(pd.concat([df_unified["a"], df_unified["b"]]).astype("string")).tolist()
+
+            self.progress_text.emit("読みキャッシュ準備中…")
+            prewarm_reading_caches(surfaces, keepchoon=True)  # ← ここでキャッシュを前広に効かせる
+
+            # === 再採点・再分類 ===
             df_unified = recalibrate_reading_like_scores(df_unified, read_th=self.read_th)
 
-            # 88.6%: ★最終スコアを combined に強制（score_reasonは作らない・既存も捨てる）
+            # 最終スコアを combined に強制（score_reasonは作らない）
             df_unified = enforce_combined_similarity_score(
                 df_unified,
                 keep_backup=False,
                 drop_existing_backup=True,
             )
 
-            # 88.7%: ★「読み一致で 1.0」は 'basic' に付け替え
+            # 読み一致で 1.0 は 'basic' に付け替え
             df_unified = reclassify_basic_for_reading_eq(df_unified, eps=0.0005)
 
-            # ★ 追加: 読み一致（表記違い）へ再分類
+            # 読み一致（表記違い）へ再分類 → サニタイズ
             df_unified = reclassify_reading_equal_formdiff(df_unified)
             df_unified = sanitize_reading_same(df_unified)
 
-            # 89%: 小数第3位に丸め（念のため整合）
+            # スコア丸め・単独仮名除去
             if df_unified is not None and not df_unified.empty and "score" in df_unified.columns:
                 df_unified["score"] = pd.to_numeric(df_unified["score"], errors="coerce").round(3)
-
-            # 90%: 単独仮名除去
             if not df_unified.empty and "a" in df_unified.columns:
                 df_unified = df_unified[~df_unified["a"].apply(is_single_kana_char)].reset_index(drop=True)
-            self._emit(90)
+            self._emit(98)
 
-            # ===== 差し替え: 92% トークン一覧整形（sentence を追加） =====
-            # 92%: トークン一覧整形
+            # トークン一覧（fine/compound/bunsetsu/sentence）整形
             parts = []
             if len(tokens_fine) > 0:
                 df_fine = pd.DataFrame(tokens_fine, columns=["token", "count"]); df_fine["type"] = "fine"; parts.append(df_fine)
             if len(tokens_compound) > 0:
                 df_comp = pd.DataFrame(tokens_compound, columns=["token", "count"]); df_comp["type"] = "compound"; parts.append(df_comp)
             if len(tokens_bunsetsu) > 0:
-                df_bun = pd.DataFrame(tokens_bunsetsu, columns=["token", "count"]); df_bun["type"] = "bunsetsu"; parts.append(df_bun)
+                df_bun  = pd.DataFrame(tokens_bunsetsu, columns=["token", "count"]); df_bun["type"] = "bunsetsu"; parts.append(df_bun)
             if len(tokens_sentence) > 0:
                 df_sent = pd.DataFrame(tokens_sentence, columns=["token", "count"]); df_sent["type"] = "sentence"; parts.append(df_sent)
-
-            df_tokens = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["type", "token", "count"])
+            df_tokens = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["type","token","count"])
             if not df_tokens.empty:
-                df_tokens = df_tokens["type token count".split()].sort_values(["type", "count", "token"], ascending=[True, False, True])
-            self._emit(92)
-            # ===== 差し替えここまで =====
+                df_tokens = df_tokens["type token count".split()].sort_values(["type","count","token"], ascending=[True, False, True])
 
-
-            # 93%: 表示用ラベル変換（2分類）
+            # 表示用ラベル変換・各種前計算（端差/数字以外一致/内包/字数）
             df_unified = apply_reason_ja(df_unified)
 
-            # 93.5%: 端差 / 数字以外一致（ベクトル化に置換）
             try:
                 if df_unified is not None and not df_unified.empty and "a" in df_unified.columns and "b" in df_unified.columns:
                     df_unified["端差"] = _edge_labels_vectorized(df_unified)
@@ -3506,66 +4495,57 @@ class AnalyzerWorker(QObject):
             except Exception:
                 pass
 
-            # 93.6%: 内包関係フラグ（a ∈ b または b ∈ a）を前計算して列化
-            # 目的：プロキシ側での毎行NFKC/比較を避け、ビュー操作を軽くする
+            # 内包フラグの前計算
             try:
-                if df_unified is not None and not df_unified.empty and {"a", "b"}.issubset(df_unified.columns):
-                    # NFKC + lower を事前にかけ、空や完全一致は内包から除外
+                if df_unified is not None and not df_unified.empty and {"a","b"}.issubset(df_unified.columns):
                     sa = df_unified["a"].astype("string").map(lambda x: nfkc(x or "").lower())
                     sb = df_unified["b"].astype("string").map(lambda x: nfkc(x or "").lower())
-
-                    # ★ ここを “行ごと” の評価に置き換える（Series 同士の .str.contains は不可）
                     def _contains_pair(a: str, b: str) -> bool:
                         if not a or not b:
                             return False
                         if a == b:
                             return False
                         return (a.find(b) != -1) or (b.find(a) != -1)
-
                     df_unified["__contains__"] = [
                         _contains_pair(aa, bb) for aa, bb in zip(sa.tolist(), sb.tolist())
                     ]
                 else:
-                    # 列が足りない場合は False で埋めておく
                     if df_unified is not None and not df_unified.empty:
                         df_unified["__contains__"] = False
             except Exception:
-                # 何かあれば安全側に倒す（フォールバック計算に任せる）
                 if df_unified is not None and not df_unified.empty:
                     df_unified["__contains__"] = False
 
-
-
-            # 94%: 字数を Worker 側で付与（UIの仕事を減らす）
+            # 字数
             if not df_unified.empty and "a" in df_unified.columns:
                 try:
                     df_unified["字数"] = df_unified["a"].astype("string").str.len().fillna(0).astype(int)
                 except Exception:
                     df_unified["字数"] = df_unified["a"].astype(str).str.len().fillna(0).astype(int)
 
-            # 95%: 表示列の概ねの順番をここで整えておく（gid は UI 付与のため除外）
+            # 列順ざっくり整形
             cols = list(df_unified.columns)
             pref = [c for c in ["字数", "a", "b"] if c in cols]
             rest = [c for c in cols if c not in pref]
             df_unified = df_unified[pref + rest]
 
-            # 96%: グループ割当（既存）
+            # グループ割当・gid 付与
             self.progress_text.emit("グループ割当中…")
             df_groups, surf2gid, gid2members = build_variation_groups(df_unified, df_lex)
-
-            # 97%: gid 付与（UI軽量化）
             if not df_unified.empty and "a" in df_unified.columns:
                 df_unified["gid"] = df_unified["a"].map(
                     lambda x: surf2gid.get(x) if isinstance(x, str) and x else None
                 )
 
-            # 98%: 完了
-            self._emit(98)
+            # 完了！
+            self._emit(100)
             self.progress_text.emit("仕上げ中…")
             self.finished.emit(
                 {"unified": df_unified, "tokens": df_tokens, "groups": df_groups,
-                "surf2gid": surf2gid, "gid2members": gid2members}, ""
+                "surf2gid": surf2gid, "gid2members": gid2members},
+                ""
             )
+
         except Exception as e:
             self.finished.emit({}, str(e))
 
@@ -3714,7 +4694,7 @@ class DropArea(QTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.51]")
+        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.60]")
         self.resize(1000, 700)
 
         # ---- レイアウト骨格 ----
@@ -3780,6 +4760,14 @@ class MainWindow(QMainWindow):
         self.dsb_char.setValue(0.85)
         form.addRow("読み 類似しきい値", self.dsb_read)
         form.addRow("文字 類似しきい値", self.dsb_char)
+
+        # ===== [PATCH] 設定：NLPテキスト保存トグルを追加 =====
+        # self.chk_save_nlp = QCheckBox("NLPテキスト保存")
+        # self.chk_save_nlp.setChecked(False)
+        # self.chk_save_nlp.setToolTip("MeCab / GiNZA に渡す直前のテキストを .txt で保存します（ON時）。")
+        # form.addRow("テキスト保存", self.chk_save_nlp)
+        # self.chk_save_nlp.stateChanged.connect(self.on_save_nlp_changed)
+
 
         # 実行・進捗
         self.btn_run = QPushButton("解析開始")
@@ -4410,10 +5398,17 @@ class MainWindow(QMainWindow):
             df_all["字数"] = df_all["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
         return df_all
 
+    # ===== [REPLACE] Excelエクスポート（ヘッダ候補でのフィルタ解決 版） =====
     def on_export(self):
-        """Excel（全件データ＋初期フィルタ見た目）を出力"""
-        import json, math as _math
+        """Excel（全件 + GUIの初期フィルタ状態）を出力"""
+        import math as _math
+        import json
+        import pandas as pd
+        from PySide6.QtWidgets import QMessageBox, QFileDialog
+        from openpyxl.utils import get_column_letter, column_index_from_string
+        from openpyxl.worksheet.filters import CustomFilters, CustomFilter, FilterColumn
 
+        # 1) 全件データの取得
         try:
             df_all = self._build_unified_df_with_selection_all()
         except Exception:
@@ -4429,199 +5424,300 @@ class MainWindow(QMainWindow):
             if "字数" not in df_all.columns and "a" in df_all.columns:
                 df_all["字数"] = df_all["a"].map(lambda x: len(str(x)) if x is not None else 0).astype(int)
 
-        # Excel安全化
-        def _sanitize_df_for_excel(df: pd.DataFrame) -> pd.DataFrame:
-            def coerce(v):
-                if v is None: return ""
-                if isinstance(v, float) and _math.isnan(v): return ""
-                if isinstance(v, (dict, list, tuple, set)):
-                    try: return json.dumps(v, ensure_ascii=False)
-                    except Exception: return str(v)
-                return v
-            df = df.copy()
-            for c in df.columns:
-                if df[c].dtype == "object":
-                    df[c] = df[c].map(coerce)
-            return df
+        if df_all.empty:
+            QMessageBox.information(self, "情報", "エクスポートするデータがありません。")
+            return
 
-        df_all = _sanitize_df_for_excel(df_all)
-
-        # 保存ダイアログ
-        path, _ = QFileDialog.getSaveFileName(self, "Excelの保存先", "variants_unified.xlsx", "Excel ファイル (*.xlsx)")
+        # 2) 保存先
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Excelの保存先", "variants_unified.xlsx", "Excel ファイル (*.xlsx)"
+        )
         if not path:
             return
 
-        # GUIフィルタ状態
+        # 3) GUI フィルタ状態
         scopes_on = sorted(list(self._selected_scopes()))
         reasons_on = sorted(list(self._selected_reasons()))
         hide_prefix = self.chk_edge_prefix.isChecked()
         hide_suffix = self.chk_edge_suffix.isChecked()
+        hide_numonly = self.chk_num_only.isChecked()
+        hide_contains = self.chk_contains.isChecked()
+
         short_on = self.chk_shortlen.isChecked()
         short_n = int(self.sb_shortlen.value()) if short_on else None
+
         fulltext = (self.ed_filter.text() or "").strip()
         need_full = bool(fulltext)
 
-        # 許可リスト（Blanks対応）
-        BLANK_TOKEN = "Blanks"
-        edge_allowed_list, edge_allow_blank = None, False
-        if "端差" in df_all.columns and (hide_prefix or hide_suffix):
-            series = df_all["端差"].astype(str)
-            uniq = set(s.strip() for s in series.fillna(""))
-            deny = set()
-            if hide_prefix: deny |= {"前1字有無", "前1字違い"}
-            if hide_suffix: deny |= {"後1字有無", "後1字違い"}
-            edge_allow_blank = ("" in uniq)
-            allowed = [v for v in sorted(uniq) if v and v not in deny]
-            if edge_allow_blank:
-                allowed = [BLANK_TOKEN] + allowed
-            edge_allowed_list = allowed
+        # 4) 書き出し用の補助列
+        if "字数" not in df_all.columns and "a" in df_all.columns:
+            df_all["字数"] = df_all["a"].astype("string").fillna("").str.len().astype(int)
 
-        num_allowed_list, num_allow_blank = None, False
-        if "数字以外一致" in df_all.columns and self.chk_num_only.isChecked():
-            series = df_all["数字以外一致"].astype(str)
-            uniq = set(s.strip() for s in series.fillna(""))
-            num_allow_blank = ("" in uniq)
-            allowed = [v for v in sorted(uniq) if v and v != "数字以外一致"]
-            if num_allow_blank:
-                allowed = [BLANK_TOKEN] + allowed
-            num_allowed_list = allowed
-
-        if need_full:
-            cols_for_full = [c for c in ["a", "b", "一致要因", "対象"] if c in df_all.columns]
-            df_all["全文__concat"] = (
-                df_all[cols_for_full].astype(str).fillna("").agg(" / ".join, axis=1)
-            ) if cols_for_full else ""
-
-        # --- 追加: 内包関係除外（Excelの初期表示マスクにも反映） ---
-        if self.chk_contains.isChecked() and "a" in df_all.columns and "b" in df_all.columns:
+        if hide_contains and {"a", "b"}.issubset(df_all.columns):
             def _contains_row(a, b):
                 sa = nfkc(str(a or "")).lower()
                 sb = nfkc(str(b or "")).lower()
-                return (sa and sb and sa != sb and (sa.find(sb) != -1 or sb.find(sa) != -1))
-            mask &= ~df_all.apply(lambda r: _contains_row(r.get("a", ""), r.get("b", "")), axis=1)
+                return bool(sa and sb and sa != sb and (sa.find(sb) != -1 or sb.find(sa) != -1))
+            df_all["__contains__"] = [_contains_row(a, b) for a, b in zip(df_all["a"], df_all["b"])]
+
+        if need_full:
+            cols_for_full = [c for c in ["a", "b", "一致要因", "対象", "scope", "target"] if c in df_all.columns]
+            if cols_for_full:
+                df_all["全文__concat"] = df_all[cols_for_full].astype(str).fillna("").agg(" / ".join, axis=1)
+            else:
+                need_full = False
+
+        # 5) pandas → openpyxl
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            sheet_name = "表記ゆれ候補"
+
+            # --- [ADD] Excel 禁止文字のクリーンアップ（to_excel の直前） ---
+            from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+            import pandas as pd
+            import numpy as np
+
+            def _clean_illegal_excel_chars(df: pd.DataFrame) -> pd.DataFrame:
+                # 文字列系の列だけ対象（数値や日付の型を壊さない）
+                str_like = df.select_dtypes(include=["object", "string"]).columns
+                if len(str_like) == 0:
+                    return df
+                def _clean_one(v):
+                    if isinstance(v, str):
+                        # 制御文字を除去
+                        return ILLEGAL_CHARACTERS_RE.sub("", v)
+                    return v
+                # 列ごとに map（型崩れ最小化）
+                for c in str_like:
+                    df[c] = df[c].map(_clean_one)
+                return df
+
+            df_all = _clean_illegal_excel_chars(df_all)
+            # --- [/ADD] ---
+
+            df_all.to_excel(writer, sheet_name=sheet_name, index=False)
+            wb = writer.book
+            ws = writer.sheets[sheet_name]
+
+            # ===== [ADD] Excelヘッダだけ上書き（出力専用の表示名差し替え） =====
+            # 既存の1行目ヘッダを読み出し
+            headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+
+            # 出力専用の表示名マップ（左=元の列名 / 右=Excelで見せたい見出し）
+            # ※ DataFrame 側の列名は変更しません。Excel表示だけ変えます。
+            header_map_excel_only = {
+                "scope": "対象",          # 英名→日本語
+                "target": "対象",         # 念のため
+                "__contains__": "内包関係", # 内部列→日本語
+                "a_count": "a数",    # 実テーブルの表示名に合わせてここを変えてください
+                "b_count": "b数",
+                "score":   "類似度",
+
+                # 必要ならここに追加できます:
+                # "a": "A", "b": "B", など
+            }
+
+            # 既存の日本語名をそのまま使うための保護
+            # 例: すでに「対象」見出しがあるのに "target" を「対象」にすると重複する場合があるため、
+            #     その場合は「対象(2)」のように重複回避します（Excelは重複でも動きますが念のため）。
+            def _unique_header_name(desired: str, used: set[str]) -> str:
+                if desired not in used:
+                    return desired
+                k = 2
+                while f"{desired}({k})" in used:
+                    k += 1
+                return f"{desired}({k})"
+
+            used = set(h for h in headers if h)
+            for col_idx, old in enumerate(headers, start=1):
+                if old in header_map_excel_only:
+                    new_name = _unique_header_name(header_map_excel_only[old], used)
+                    ws.cell(row=1, column=col_idx, value=new_name)
+                    used.add(new_name)
+
+            # 以降のフィルタ列解決は「正規化名＋旧名の候補」で行えるように、
+            # 先にヘッダを取り直しておくと安心
+            headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+            # ===== [/ADD] =====
 
 
-        # 初期表示マスク（True=表示）
-        mask = pd.Series(True, index=df_all.index)
-        if scopes_on and "対象" in df_all.columns:
-            mask &= df_all["対象"].astype(str).isin(scopes_on)
-        if reasons_on and "一致要因" in df_all.columns:
-            mask &= df_all["一致要因"].astype(str).isin(reasons_on)
-        if edge_allowed_list is not None and "端差" in df_all.columns:
-            vals = df_all["端差"].astype(str).fillna("")
-            nonblank_set = set(v for v in edge_allowed_list if v != BLANK_TOKEN)
-            cond_nonblank = vals.str.strip().isin(nonblank_set) if nonblank_set else pd.Series(False, index=vals.index)
-            cond_blank = vals.str.strip().eq("") if edge_allow_blank else pd.Series(False, index=vals.index)
-            mask &= (cond_nonblank | cond_blank)
-        if num_allowed_list is not None and "数字以外一致" in df_all.columns:
-            vals = df_all["数字以外一致"].astype(str).fillna("")
-            nonblank_set = set(v for v in num_allowed_list if v != BLANK_TOKEN)
-            cond_nonblank = vals.str.strip().isin(nonblank_set) if nonblank_set else pd.Series(False, index=vals.index)
-            cond_blank = vals.str.strip().eq("") if num_allow_blank else pd.Series(False, index=vals.index)
-            mask &= (cond_nonblank | cond_blank)
-        if short_on and "字数" in df_all.columns:
-            mask &= pd.to_numeric(df_all["字数"], errors="coerce").fillna(0) > short_n
-        if need_full and "全文__concat" in df_all.columns:
-            mask &= df_all["全文__concat"].astype(str).str.contains(fulltext, case=False, na=False)
+            # ヘッダ固定・AutoFilter 範囲設定
+            ws.freeze_panes = "A2"  # 1行目固定（見やすさ）[3](https://dnmtechs.com/freezing-header-row-in-openpyxl/)
+            ws.auto_filter.ref = ws.dimensions  # シート全体にフィルタ[4](https://stackoverflow.com/questions/51566349/openpyxl-how-to-add-filters-to-all-columns)
 
-        # エクスポート（xlsxwriter 優先）
-        try:
-            import xlsxwriter  # noqa
-            engine = "xlsxwriter"
-        except Exception:
-            engine = "openpyxl"
+            # === 列解決ヘルパ（複数候補を許容） ===
+            def __find_col(candidates):
+                """
+                candidates: ヘッダ候補（タプル/リスト/文字列）を上から順に探す
+                戻り値: 1起点の列番号 or None
+                """
+                if not isinstance(candidates, (tuple, list)):
+                    candidates = (candidates,)
+                # 1行目を走査
+                header_texts = [str(cell.value).strip() if cell.value is not None else "" for cell in ws[1]]
+                # 完全一致優先
+                for cand in candidates:
+                    for idx, name in enumerate(header_texts, start=1):
+                        if name == cand:
+                            return idx
+                # 大文字小文字/空白差などを吸収するゆるめ一致
+                norm = lambda s: nfkc(str(s or "")).strip().lower()
+                cand_norm = [norm(c) for c in candidates]
+                for idx, name in enumerate(header_texts, start=1):
+                    if norm(name) in cand_norm:
+                        return idx
+                return None
 
-        try:
-            with pd.ExcelWriter(path, engine=engine) as writer:
-                sheet_main = "表記ゆれ候補"
-                df_all.to_excel(writer, index=False, sheet_name=sheet_main)
-                nrows, ncols = df_all.shape
+            # 0起点 col_id を得るために左端列を取得
+            left_ref = ws.auto_filter.ref.split(":")[0]
+            start_col_idx = column_index_from_string("".join(ch for ch in left_ref if ch.isalpha()))
 
-                def col_idx(col_name):
-                    try:
-                        return df_all.columns.get_loc(col_name)
-                    except Exception:
-                        return None
+            def _add_value_filter(header_names, values, allow_blank=False):
+                """値リストによる表示フィルタ（header_names は候補群に対応）"""
+                values = [v for v in (values or []) if (v is not None and str(v) != "")]
+                if not values and not allow_blank:
+                    return
+                col = __find_col(header_names)
+                if not col:
+                    return
+                col_id = (col - start_col_idx)  # 0起点
+                ws.auto_filter.add_filter_column(
+                    col_id,
+                    list(dict.fromkeys(map(str, values))),
+                    blank=bool(allow_blank)
+                )
+                # add_filter_column の使い方（値リスト/ブランク許容）[1](https://openpyxl.pages.heptapod.net/openpyxl/api/openpyxl.worksheet.filters.html)
 
-                ci_len   = col_idx("字数")
-                ci_reason= col_idx("一致要因")
-                ci_scope = col_idx("対象")
-                ci_edge  = col_idx("端差")
-                ci_num   = col_idx("数字以外一致")
-                ci_full  = col_idx("全文__concat") if need_full else None
+            def _add_number_threshold_filter(header_names, operator: str, val: int):
+                """数値カスタムフィルタ（>=, <= など）"""
+                col = __find_col(header_names)
+                if not col:
+                    return
+                col_id = (col - start_col_idx)
+                cf = CustomFilters()
+                cf.customFilter = [CustomFilter(operator=operator, val=str(val))]
+                ws.auto_filter.filterColumn.append(FilterColumn(colId=col_id, customFilters=cf))
+                # カスタムフィルタの低レベルAPI[1](https://openpyxl.pages.heptapod.net/openpyxl/api/openpyxl.worksheet.filters.html)
 
-                if engine == "xlsxwriter":
-                    wb = writer.book
-                    ws = writer.sheets[sheet_main]
-                    ws.freeze_panes(1, 1)
-                    ws.autofilter(0, 0, nrows, max(0, ncols - 1))
+            # (a) 対象（= scope 表示列）
+            #     ← ここが修正ポイント：("対象","scope","target") の順で探索
+            if scopes_on:
+                _add_value_filter(("対象", "scope", "target"), scopes_on, allow_blank=False)
 
-                    if ci_scope is not None and scopes_on:
-                        uniq_scopes = set(str(x) for x in df_all["対象"].dropna().astype(str))
-                        if len(scopes_on) < len(uniq_scopes):
-                            ws.filter_column_list(ci_scope, [str(v) for v in scopes_on])
+            # (b) 一致要因
+            if reasons_on and ("一致要因" in df_all.columns):
+                _add_value_filter(("一致要因",), reasons_on, allow_blank=False)
 
-                    if ci_reason is not None and reasons_on:
-                        uniq_reasons = set(str(x) for x in df_all["一致要因"].dropna().astype(str))
-                        if len(reasons_on) < len(uniq_reasons):
-                            ws.filter_column_list(ci_reason, [str(v) for v in reasons_on])
+            # (c) 端差（前/後1字を隠す → 許容値のみ残す）
+            if "端差" in df_all.columns and (hide_prefix or hide_suffix):
+                series = df_all["端差"].astype(str)
+                uniq = set(s.strip() for s in series.fillna(""))
+                deny = set()
+                if hide_prefix: deny |= {"前1字有無", "前1字違い"}
+                if hide_suffix: deny |= {"後1字有無", "後1字違い"}
+                allow_blank = ("" in uniq)
+                allowed = [v for v in sorted(uniq) if v and v not in deny]
+                _add_value_filter(("端差",), allowed, allow_blank=allow_blank)
 
-                    if ci_edge is not None and edge_allowed_list is not None:
-                        uniq_edge = set(str(x).strip() for x in df_all["端差"].fillna(""))
-                        if 0 < len(edge_allowed_list) < len(uniq_edge) + (1 if edge_allow_blank else 0):
-                            ws.filter_column_list(ci_edge, edge_allowed_list)
+            # (d) 数字以外一致（隠す）
+            if "数字以外一致" in df_all.columns and hide_numonly:
+                series = df_all["数字以外一致"].astype(str)
+                uniq = set(s.strip() for s in series.fillna(""))
+                allow_blank = ("" in uniq)
+                allowed = [v for v in sorted(uniq) if v and v != "数字以外一致"]
+                _add_value_filter(("数字以外一致",), allowed, allow_blank=allow_blank)
 
-                    if ci_num is not None and num_allowed_list is not None:
-                        uniq_num = set(str(x).strip() for x in df_all["数字以外一致"].fillna(""))
-                        if 0 < len(num_allowed_list) < len(uniq_num) + (1 if num_allow_blank else 0):
-                            ws.filter_column_list(ci_num, num_allowed_list)
+            # (e) 短文（字数 <= N を隠す → 字数 >= N+1 を残す）
+            if short_on and isinstance(short_n, int) and short_n > 0:
+                _add_number_threshold_filter(("字数",), operator="greaterThanOrEqual", val=int(short_n) + 1)
 
-                    if ci_len is not None and short_on:
-                        ws.filter_column(ci_len, f'x > {short_n}')
+            # (f) 内包関係除外（True を除外 → False のみ許容）
+            # hide_contains が True のとき、False のみ表示（= True を除外）
+            if hide_contains and ("__contains__" in df_all.columns or "内包関係" in headers):
+                _add_value_filter(("内包関係", "__contains__"), [False], allow_blank=False)
 
-                    if ci_full is not None and fulltext:
-                        def _xf_escape(s: str) -> str:
-                            return s.replace('~', '~~').replace('*', '~*').replace('?', '~?')
-                        ws.filter_column(ci_full, f"x == *{_xf_escape(fulltext)}*")
-                        ws.set_column(ci_full, ci_full, None, None, {"hidden": True})
+            # (g) 全文（部分一致を代替：該当レコードの値リストでホワイトリスト化）
+            if need_full and "全文__concat" in df_all.columns:
+                vals = df_all.loc[df_all["全文__concat"].str.contains(fulltext, case=False, na=False), "全文__concat"]
+                if len(vals) > 0:
+                    _add_value_filter(("全文__concat",), list(pd.unique(vals.astype(str))), allow_blank=False)
 
-                    # 非該当行を非表示（ヘッダを除く）
-                    for i, ok in enumerate(mask.tolist()):
-                        if not ok:
-                            ws.set_row(i + 1, None, None, {'hidden': True})
+            ws.auto_filter.ref = ws.dimensions  # 念のため同期
 
-                    # 列幅
-                    num_fmt_int = wb.add_format({"align": "right"})
-                    num_fmt_3   = wb.add_format({"num_format": "0.000", "align": "right"})
-                    def set_w(name, width, fmt=None):
-                        ci = col_idx(name)
-                        if ci is not None:
-                            ws.set_column(ci, ci, width, fmt)
-                    set_w("選択", 7)
-                    set_w("gid", 7, num_fmt_int)
-                    set_w("字数", 6, num_fmt_int)
-                    set_w("a", 32); set_w("b", 32)
-                    set_w("一致要因", 12); set_w("対象", 10)
-                    set_w("端差", 10); set_w("数字以外一致", 12)
-                    set_w("score", 8, num_fmt_3)
+            # --- A) 非マッチ行を隠す（例：「対象/scope」が scopes_on のみ表示） ---
+            from openpyxl.utils import column_index_from_string
 
-                else:
-                    ws = writer.sheets[sheet_main]
-                    try:
-                        from openpyxl.utils import get_column_letter
-                        last_row = max(1, nrows + 1)
-                        last_col = max(1, ncols)
-                        ws.auto_filter.ref = f"A1:{get_column_letter(last_col)}{last_row}"
-                        ws.freeze_panes = "B2"
-                        for i, ok in enumerate(mask.tolist(), start=2):
-                            if not ok:
-                                ws.row_dimensions[i].hidden = True
-                    except Exception:
-                        pass
+            ws = writer.sheets[sheet_name]  # pandas.ExcelWriter から取り出したシート
 
-            QMessageBox.information(self, "完了", "Excel（全件＋初期フィルタ）を出力しました。")
-        except Exception as e:
-            QMessageBox.critical(self, "エラー", str(e))
+            # ---- [ADD at 保存直前ブロック] 数値以外一致の行を先に隠す ----
+            headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+
+            def _find_col(cands):
+                if not isinstance(cands, (tuple, list)): cands = (cands,)
+                # 完全一致
+                for nm in cands:
+                    if nm in headers: return headers.index(nm) + 1
+                # ゆるめ一致（NFKC を使わず簡易に）
+                def _norm(s): return str(s or "").strip().lower()
+                H = [_norm(h) for h in headers]
+                for nm in cands:
+                    nn = _norm(nm)
+                    if nn in H: return H.index(nn) + 1
+                return None
+
+            def _is_truthy(v):
+                s = str(v).strip().lower()
+                return (s in {"true","1","t","y","yes","はい","有","○","◯"}
+                        or str(v).strip() in {"数値以外一致","数字以外一致"})
+
+            if hide_numonly:
+                col_num = _find_col(("数値以外一致","数字以外一致","non_numeric_match"))
+                if col_num:
+                    for r in range(2, ws.max_row + 1):
+                        v = ws.cell(row=r, column=col_num).value
+                        if _is_truthy(v):  # ←「数値以外一致」と判定された行は非表示に
+                            ws.row_dimensions[r].hidden = True
+            # ---- [/ADD] ----
+
+
+            headers = [str(c.value).strip() if c.value is not None else "" for c in ws[1]]
+
+            def _find_col(cands):
+                if not isinstance(cands, (tuple, list)): cands = (cands,)
+                # 完全一致
+                for nm in cands:
+                    if nm in headers: return headers.index(nm) + 1
+                # ゆるめ（NFKC・小文字）
+                def norm(s): return nfkc(str(s or "")).strip().lower()
+                H = [norm(h) for h in headers]
+                for nm in cands:
+                    if norm(nm) in H: return H.index(norm(nm)) + 1
+                return None
+
+            col_scope = _find_col(("対象", "scope", "target"))
+
+            if col_scope and scopes_on:
+                show_set = set(map(str, scopes_on))
+                # データ行（2行目〜最終行）を評価
+                for r in range(2, ws.max_row + 1):
+                    v = ws.cell(row=r, column=col_scope).value
+                    if str(v) not in show_set:
+                        ws.row_dimensions[r].hidden = True  # ← ここで非表示にする
+
+            # --- AutoFilter は定義として残す（ドロップダウン＆条件表示用） ---
+            ws.auto_filter.ref = ws.dimensions
+            left_ref = ws.auto_filter.ref.split(":")[0]
+            start_col_idx = column_index_from_string("".join(ch for ch in left_ref if ch.isalpha()))
+            col_id = (col_scope - start_col_idx) if col_scope else None
+            if col_id is not None:
+                ws.auto_filter.add_filter_column(col_id, list(show_set), blank=False)
+
+        self.statusBar().showMessage("Excelを出力しました", 5000)
+        QMessageBox.information(
+            self, "完了",
+            "Excelエクスポートが完了しました。"
+        )
+    # ===== [/REPLACE] =====
+
 
     def on_mark_pdf(self):
         """チェック済みの行に行番号(1,2,...)を振り、行内の a/b に 1-a, 1-b ... の注釈を付ける"""
@@ -4989,6 +6085,13 @@ class MainWindow(QMainWindow):
         )
         self.diff_view.setHtml(html)
     # ===== 差し替えここまで =====
+
+    # ===== [ADD] MainWindow: NLPテキスト保存のON/OFF反映 =====
+    def on_save_nlp_changed(self, state):
+        # UI のチェック状態をグローバルトグルへ反映
+        set_save_nlp(bool(state))
+    # ===== [/ADD] =====
+
 
 
 def main():
