@@ -1383,7 +1383,29 @@ def _compose_text_from_rawdict(
     # A~C条件で横行を結合（KEEP_NL維持・英数スペース補完・境界行除外）
     def _merge_all_horizontal_lines(line_dicts: list[dict]) -> str:
         import re
-        KEEP = "[KEEP_NL]"  # 保険で再定義
+        KEEP = "[KEEP_NL]"
+
+        def _is_bullet_line(text: str) -> bool:
+            """行頭がビュレット(箇条書き記号)かどうか判定"""
+            if not text:
+                return False
+            
+            # よくあるビュレット文字パターン
+            bullet_patterns = [
+                r'^[・•●○◆◇■□▪▫★☆→⇒›»]',  # 記号類
+                r'^[①-⑳]',  # 丸数字
+                r'^[⑴-⒇]',  # 括弧付き数字
+                r'^[\d]+[.．)）]\s',  # 1. 1) 1） などの数字+区切り
+                r'^[a-zA-Z][.．)）]\s',  # a. a) などの英字+区切り
+                r'^[-−‐–—]\s',  # ハイフン類
+                r'^[*＊]\s',  # アスタリスク
+                r'^[+＋]\s',  # プラス記号
+            ]
+            
+            for pattern in bullet_patterns:
+                if re.match(pattern, text.strip()):
+                    return True
+            return False
 
         def _is_merge_exempt(text: str) -> bool:
             s = re.sub(r'\s+', '', text or '')
@@ -1410,13 +1432,22 @@ def _compose_text_from_rawdict(
 
         if not line_dicts:
             return ""
+        
         merged: list[str] = []
         buffer = line_dicts[0]["text"]
+        
         for i in range(1, len(line_dicts)):
             prev_line = line_dicts[i - 1]
             curr_line = line_dicts[i]
 
+            # 前の行または現在の行が結合除外対象の場合
             if _is_merge_exempt(prev_line["text"]) or _is_merge_exempt(curr_line["text"]):
+                merged.append(buffer + KEEP)
+                buffer = curr_line["text"]
+                continue
+
+            # 現在の行がビュレット行の場合は改行を保持
+            if _is_bullet_line(curr_line["text"]):
                 merged.append(buffer + KEEP)
                 buffer = curr_line["text"]
                 continue
@@ -1428,12 +1459,12 @@ def _compose_text_from_rawdict(
                 (curr_line["top"] - prev_line["top"]) <= 2.0 * max(1.0, prev_line["height"])
             )
             # C: フォント差（±10%以内）
-            prev = float(prev_line.get("font_size") or 0.0)
-            curr = float(curr_line.get("font_size") or 0.0)
+            prev_fs = float(prev_line.get("font_size") or 0.0)
+            curr_fs = float(curr_line.get("font_size") or 0.0)
             TOL = 0.10
             font_diff_ok = (
-                (prev == 0.0 and curr == 0.0)
-                or (prev > 0.0 and curr > 0.0 and (1 - TOL) <= (curr / prev) <= (1 + TOL))
+                (prev_fs == 0.0 and curr_fs == 0.0)
+                or (prev_fs > 0.0 and curr_fs > 0.0 and (1 - TOL) <= (curr_fs / prev_fs) <= (1 + TOL))
             )
 
             if x_overlap and y_condition and font_diff_ok:
@@ -2217,19 +2248,21 @@ def prewarm_reading_caches(surfaces: List[str], *, keepchoon: bool = True):
         if keepchoon:
             _ = phrase_reading_norm_keepchoon_cached(s)  # 長音あり骨格
 
-# ------------------------------------------------------------
-# Token抽出（正規表現ベース, MeCabなしフォールバック用）
-# ------------------------------------------------------------
+# ===== [REPLACE] extract_candidates_regex: 候補抽出時にフィルタ =====
 def extract_candidates_regex(pages: List[PageData], min_len=1, max_len=120, min_count=1):
     cnt = Counter()
     for p in pages:
         for m in TOKEN_RE.finditer(p.text_join):
             w = m.group(0)
+            # ★ ここでフィルタ適用(早期除外)
+            if _should_skip_for_pairing(w):
+                continue
             if min_len <= len(w) <= max_len:
                 cnt[w] += 1
     arr = [(w, c) for w, c in cnt.items() if c >= min_count]
     arr.sort(key=lambda x: (-x[1], x[0]))
     return arr
+# ===== [/REPLACE] =====
 
 # ------------------------------------------------------------
 # Compound（連結記号でのみ結合）
@@ -2293,22 +2326,24 @@ def mecab_compound_tokens_alljoin(text: str) -> List[str]:
     return out
 # ===== [/REPLACE] =====
 
-# ===== [REPLACE] 複合語候補抽出：MeCab 投入直前のテキストを保存 =====
+# ===== [REPLACE] extract_candidates_compound_alljoin: 候補抽出時にフィルタ =====
 def extract_candidates_compound_alljoin(
     pages: List[PageData], min_len=1, max_len=120, min_count=1, top_k=0, use_mecab=True
 ):
     if use_mecab and HAS_MECAB:
         cnt = Counter()
         for p in pages:
-            # ★ 投げる直前のテキストを保存
             try:
                 save_nlp_input("mecab_compound", p.text_join, suffix=f"{p.pdf}_p{p.page}")
             except Exception:
                 pass
 
             for w in mecab_compound_tokens_alljoin(p.text_join):
-                w = strip_leading_control_chars(w)  # 既存処理
+                w = strip_leading_control_chars(w)
                 if not w:
+                    continue
+                # ★ ここでフィルタ適用(早期除外)
+                if _should_skip_for_pairing(w):
                     continue
                 if min_len <= len(w) <= max_len:
                     cnt[w] += 1
@@ -2317,10 +2352,9 @@ def extract_candidates_compound_alljoin(
         arr.sort(key=lambda x: (-x[1], x[0]))
         return arr if (not top_k or top_k <= 0) else arr[:top_k]
     else:
-        # MeCab なしのフォールバック（保存は不要）
+        # MeCab なしフォールバック
         return extract_candidates_regex(pages, min_len=min_len, max_len=max_len, min_count=min_count)
 # ===== [/REPLACE] =====
-
 
 # ------------------------------------------------------------
 # 文節抽出（簡易ルール）
@@ -2887,6 +2921,77 @@ def numeric_only_label(a: str, b: str) -> str:
     """表示用ラベル（該当時のみ '数字以外一致' を返す）"""
     return "数字以外一致" if is_numeric_only_diff(a, b) else ""
 
+# ===== [ADD] ペア作成前の共通フィルタ関数(グローバルヘルパーとして追加) =====
+# ※ is_numeric_only_diff() の直後あたりに配置するのが適切
+
+def _should_skip_for_pairing(s: str) -> bool:
+    """
+    ペア作成時にスキップすべき文字列かどうかを判定
+    - 数字のみ(ただし時刻/日付形式は除く)
+    - アルファベット1文字のみ(全角含む)
+    - 記号のみ
+    
+    戻り値:
+        True: スキップすべき(候補から除外)
+        False: ペア作成対象として保持
+    """
+    if not isinstance(s, str) or not s:
+        return True
+    
+    s_strip = s.strip()
+    if not s_strip:
+        return True
+    
+    # === 1) 数字のみ(ただし時刻/日付は許容) ===
+    # 既存の正規表現を利用
+    try:
+        NUM_RE = _NUM_ONLY_LINE_RE
+    except NameError:
+        NUM_DIG = r"[0-9\uFF10-\uFF19]"
+        GROUP_SEP = r"[,\uFF0C \u00A0\u3000]"
+        DEC_SEP = r"[.\uFF0E]"
+        NUM_RE = re.compile(
+            rf"^{NUM_DIG}+(?:{GROUP_SEP}{NUM_DIG}{{3}})*(?:{DEC_SEP}{NUM_DIG}+)?$",
+            re.VERBOSE
+        )
+    
+    # 時刻/日付判定(既存ロジックを再利用)
+    TIME_RE = re.compile(
+        r"""^\s*\d{1,2}[:\uff1a]\d{2}(?:[:\uff1a]\d{2})?
+            (?:\s*(?:〜|~|\-|—|–)\s*\d{1,2}[:\uff1a]\d{2}(?:[:\uff1a]\d{2})?)?\s*$""",
+        re.VERBOSE
+    )
+    DATE_RE = re.compile(r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s*$")
+    
+    def is_time_or_date(t: str) -> bool:
+        if any(u in t for u in ("時", "分", "秒")):
+            return True
+        return bool(TIME_RE.fullmatch(t) or DATE_RE.fullmatch(t))
+    
+    # 数字のみ かつ 時刻/日付でない → スキップ
+    if NUM_RE.fullmatch(s_strip) and not is_time_or_date(s_strip):
+        return True
+    
+    # === 2) アルファベット1文字のみ(全角含む、NFKC後で判定) ===
+    try:
+        s_nfkc = nfkc(s_strip)
+    except NameError:
+        s_nfkc = unicodedata.normalize("NFKC", s_strip)
+    
+    if len(s_nfkc) == 1:
+        if ('A' <= s_nfkc <= 'Z') or ('a' <= s_nfkc <= 'z'):
+            return True
+    
+    # === 3) 記号のみ(Unicode Category 'P*' or 'S*' のみで構成) ===
+    # 空白以外の文字が全て記号/句読点なら除外
+    non_space_chars = [ch for ch in s_nfkc if not ch.isspace()]
+    if non_space_chars:
+        if all(unicodedata.category(ch).startswith(('P', 'S')) for ch in non_space_chars):
+            return True
+    
+    return False
+# ===== [/ADD] =====
+
 # ------------------------------------------------------------
 # Lexical（細粒度）語彙とペア
 # ------------------------------------------------------------
@@ -2903,7 +3008,6 @@ def collect_lexicon_general(pages: List[PageData], top_k=4000, min_count=1) -> p
     pos_map: Dict[str, Counter] = defaultdict(Counter)
 
     for p in pages:
-        # ★ 投げる直前のテキストを保存
         try:
             save_nlp_input("mecab_lexicon", p.text_join, suffix=f"{p.pdf}_p{p.page}")
         except Exception:
@@ -2912,6 +3016,10 @@ def collect_lexicon_general(pages: List[PageData], top_k=4000, min_count=1) -> p
         for surf, pos1, lemma, reading, ct, cf in tokenize_mecab(p.text_join, MECAB_TAGGER):
             if not pos1.startswith(("名詞", "動詞", "形容詞", "助動詞")):
                 continue
+            # ★ ここでフィルタ適用(早期除外)
+            if _should_skip_for_pairing(surf):
+                continue
+            
             counts[surf] += 1
             r = normalize_kana(reading or "", drop_choon=True)
             if r:
@@ -4762,11 +4870,11 @@ class MainWindow(QMainWindow):
         form.addRow("文字 類似しきい値", self.dsb_char)
 
         # ===== [PATCH] 設定：NLPテキスト保存トグルを追加 =====
-        # self.chk_save_nlp = QCheckBox("NLPテキスト保存")
-        # self.chk_save_nlp.setChecked(False)
-        # self.chk_save_nlp.setToolTip("MeCab / GiNZA に渡す直前のテキストを .txt で保存します（ON時）。")
-        # form.addRow("テキスト保存", self.chk_save_nlp)
-        # self.chk_save_nlp.stateChanged.connect(self.on_save_nlp_changed)
+        #self.chk_save_nlp = QCheckBox("NLPテキスト保存")
+        #self.chk_save_nlp.setChecked(False)
+        #self.chk_save_nlp.setToolTip("MeCab / GiNZA に渡す直前のテキストを .txt で保存します（ON時）。")
+        #form.addRow("テキスト保存", self.chk_save_nlp)
+        #self.chk_save_nlp.stateChanged.connect(self.on_save_nlp_changed)
 
 
         # 実行・進捗
