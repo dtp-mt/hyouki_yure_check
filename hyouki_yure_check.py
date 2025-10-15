@@ -191,140 +191,30 @@ def _v_is_vertical_line(ln) -> bool:
     return (iqr_y > iqr_x * 1.6)
 
 
-def _v_page_vertical_ratio(page) -> float:
-    """ページ内の text-lines に占める“縦”行の割合（0.0〜1.0）"""
-    try:
-        rd = page.get_text("rawdict") or {}
-        blocks = rd.get("blocks", []) if isinstance(rd, dict) else []
-    except Exception:
-        return 0.0
-    v = 0
-    n = 0
-    for b in blocks:
-        if b.get("type", 1) != 0:
-            continue
-        for ln in b.get("lines", []):
-            n += 1
-            if _v_is_vertical_line(ln):
-                v += 1
-    return (v / n) if n else 0.0
-
-
-def _v_vertical_text_from_rawdict(page,
-                                  drop_ruby: bool = True,
-                                  ruby_size_ratio: float = 0.60,
-                                  col_bin_ratio: float = 0.06,
-                                  char_space_ratio: float = 0.004,
-                                  char_tab_ratio: float = 0.012) -> str:
-    """
-    縦ページ向け：rawdictの Char を全収集→Xビンで縦カラム化→
-    各カラムは上→下で連結（Δyで space/tab を挿入）。
-    """
-    rd = page.get_text("rawdict") or {}
-    blocks = rd.get("blocks", []) if isinstance(rd, dict) else []
-    if not blocks:
-        return ""
-
-    width  = float(page.rect.width)
-    height = float(page.rect.height)
-
-    # 収集：全テキストChar
-    chars = []  # (c, cx, y0, y1, size)
-    for b in blocks:
-        if b.get("type", 1) != 0:
-            continue
-        for ln in b.get("lines", []):
-            for sp in ln.get("spans", []):
-                size = float(sp.get("size", 0.0) or 0.0)
-                chs = sp.get("chars")
-                if isinstance(chs, list) and chs:
-                    for ch in chs:
-                        c = ch.get("c", "")
-                        x0,y0,x1,y1 = map(float, ch.get("bbox", (0,0,0,0)))
-                        cx = (x0+x1)/2.0
-                        chars.append((c, cx, y0, y1, size))
-                else:
-                    txt = sp.get("text") or ""
-                    if not txt:
-                        continue
-                    x0,y0,x1,y1 = map(float, sp.get("bbox", (0,0,0,0)))
-                    n = max(1, len(txt))
-                    w = (x1-x0)/n if n else 0.0
-                    for i, c in enumerate(txt):
-                        cx = x0 + (i+0.5)*w
-                        chars.append((c, cx, y0, y1, size))
-
-    if not chars:
-        return ""
-
-    # ルビ抑制：サイズ中央値の 60% 未満を除外（可変）
-    if drop_ruby:
-        try:
-            import statistics as stats
-            sizes = [sz for *_, sz in chars if sz > 0]
-            med = stats.median(sizes) if sizes else 0.0
-        except Exception:
-            med = 0.0
-        if med > 0:
-            th = med * float(ruby_size_ratio or 0.60)
-            chars = [t for t in chars if not (t[-1] and t[-1] < th)]
-            if not chars:
-                return ""
-
-    # カラム化（右→左）
-    import math
-    col_bin_w = max(8.0, float(width) * float(col_bin_ratio or 0.06))
-    from collections import defaultdict
-    cols = defaultdict(list)
-    for (c, cx, y0, y1, sz) in chars:
-        key = int(math.floor(cx / col_bin_w))
-        cols[key].append((c, cx, y0, y1, sz))
-
-    # Δy による space/tabのしきい（絶対値へ）
-    char_space_v = max(1.0, height * float(char_space_ratio or 0.004))
-    char_tab_v   = max(2.0, height * float(char_tab_ratio   or 0.012))
-
-    out_cols = []
-    for k in sorted(cols.keys(), reverse=True):   # 右→左
-        col = cols[k]
-        col.sort(key=lambda t: (t[2], t[3]))      # y0→y1
-        parts = []
-        prev_y1 = None
-        for (c, cx, y0, y1, sz) in col:
-            if prev_y1 is None:
-                parts.append(c)
-            else:
-                gap = y0 - prev_y1
-                if gap >= char_tab_v:
-                    parts.append("\t"); parts.append(c)
-                elif gap >= char_space_v:
-                    parts.append(" ");  parts.append(c)
-                else:
-                    parts.append(c)
-            prev_y1 = y1
-        t = "".join(parts).strip()
-        if t:
-            out_cols.append(t)
-
-    return "\n\n".join(out_cols)
-
-
 # ==== 読み類似スコア（数・記号は読み対象外／満点抑制の強化版） ==================
 KANJI_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]")
 
+from functools import lru_cache
+
+@lru_cache(maxsize=4096)
 def _has_kanji(s: str) -> bool:
+    """文字列に漢字が含まれるか（キャッシュ付き）"""
     if not isinstance(s, str):
         s = "" if s is None else str(s)
-    s = nfkc(s)
+    s = unicodedata.normalize("NFKC", s)
     return bool(KANJI_RE.search(s))
 
+_NFKC_SPACE_RE = re.compile(r"\s+")
+
+@lru_cache(maxsize=4096)
 def _norm_len_for_surface(s: str) -> int:
-    """表層長（比較用）。NFKC→空白除去。"""
+    """表層長（比較用）。NFKC→空白除去。キャッシュ付き高速版。"""
     if s is None:
-        s = ""
-    s = nfkc(str(s))
-    s = re.sub(r"\s+", "", s)
+        return 0
+    s = unicodedata.normalize("NFKC", str(s))
+    s = _NFKC_SPACE_RE.sub("", s)
     return len(s)
+
 
 # ===== [Patch] 読み一致（reading_eq）のスコアを 1.0 固定にしない軽量スコアラー =====
 def _numeric_chunk_count(s: str) -> int:
@@ -511,8 +401,14 @@ READING_LIKE_REASONS = {"lemma", "lemma_read", "inflect", "reading"}
 # 追加：読み不一致の追加減点（調整しやすいように定数化）
 READ_MISMATCH_PENALTY = 0.03  # ←「0.99より下げたい」ニュアンスに最適化
 
+from functools import lru_cache
+
+@lru_cache(maxsize=4096)
 def _reading_for_surface_cached(s: str) -> str:
-    """表層 s の“読み（骨格）”。MeCab があればそれ、無ければ簡易フォールバック。"""
+    """
+    表層 s の“読み（骨格）”。MeCab があればそれ、無ければ簡易フォールバック。
+    キャッシュ強化済み（maxsize=4096）。
+    """
     ok, _ = ensure_mecab()
     if ok:
         return phrase_reading_norm_cached(s or "")
@@ -533,17 +429,17 @@ def _lemma_joined_for_surface(s: str) -> str:
     return "".join((lemma if (lemma and isinstance(lemma, str)) else surf)
                    for (surf, pos1, lemma, reading, ct, cf) in toks)
 
+@lru_cache(maxsize=4096)
 def _surface_core_for_reading(s: str) -> str:
-    """読み対象の“和字コア”（漢字・ひらがな・カタカナのみ）を抽出。"""
-    nf = nfkc(str(s or ""))
-    out = []
-    for ch in nf:
-        o = ord(ch)
-        if (0x3040 <= o <= 0x309F) or (0x30A0 <= o <= 0x30FF) or \
-           (0x3400 <= o <= 0x4DBF) or (0x4E00 <= o <= 0x9FFF) or \
-           (0xF900 <= o <= 0xFAFF):
-            out.append(ch)
-    return "".join(out)
+    """読み対象の“和字コア”（漢字・ひらがな・カタカナのみ）を抽出。キャッシュ付き高速版。"""
+    nf = unicodedata.normalize("NFKC", str(s or ""))
+    return "".join(ch for ch in nf if (
+        0x3040 <= ord(ch) <= 0x309F or  # ひらがな
+        0x30A0 <= ord(ch) <= 0x30FF or  # カタカナ
+        0x3400 <= ord(ch) <= 0x4DBF or  # CJK統合漢字拡張A
+        0x4E00 <= ord(ch) <= 0x9FFF or  # CJK統合漢字
+        0xF900 <= ord(ch) <= 0xFAFF     # 互換漢字
+    ))
 
 # ===== 追加: 囲み数字などの「リストマーカー」を判定 =====
 def _is_enclosed_list_marker(ch: str) -> bool:
@@ -626,16 +522,15 @@ def _script_pattern(s: str) -> str:
     nf = nfkc(str(s or ""))
     return "".join(tag(ch) for ch in nf if not ch.isspace())
 
-# --- REPLACE: recalibrate_reading_like_scores (重複ヘルパ排除) ---
 def recalibrate_reading_like_scores(df: pd.DataFrame, read_th: float) -> pd.DataFrame:
     """
     {lemma, lemma_read, inflect, reading} を読みルールで再採点し reason='reading' に揃える。
     和字コア一致は強制1.0維持。満点時の抑制・P3/P4は現状ロジックを踏襲。
     """
+    # --- 早期スキップ条件 ---
     if df is None or df.empty:
         return df
-    need_cols = {"a", "b", "reason", "score"}
-    if not need_cols.issubset(df.columns):
+    if not {"a", "b", "reason", "score"}.issubset(df.columns):
         return df
 
     mask = df["reason"].isin(READING_LIKE_REASONS)
@@ -646,8 +541,52 @@ def recalibrate_reading_like_scores(df: pd.DataFrame, read_th: float) -> pd.Data
 
     # ---- 前計算（surface単位）
     surfaces = set(df.loc[mask, "a"].astype(str)) | set(df.loc[mask, "b"].astype(str))
-    surf2read = {s: _reading_for_surface_cached(s) for s in surfaces}
-    surf2lemma = {s: _lemma_joined_for_surface(s) for s in surfaces}
+    if not surfaces:
+        return df  # 早期スキップ：対象表層が空
+
+    def _batch_reading_and_lemma(surfaces: Set[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+        """
+        表層群に対して一括で読みと lemma を取得（MeCabバッチ化）。
+        戻り値: (表層→読み, 表層→lemma連結)
+        """
+        ok, _ = ensure_mecab()
+        if not ok or MECAB_TAGGER is None:
+            # フォールバック：キャッシュ付き個別処理
+            return (
+                {s: _reading_for_surface_cached(s) for s in surfaces},
+                {s: _lemma_joined_for_surface(s) for s in surfaces}
+            )
+
+        # --- 一括解析 ---
+        # 各表層を改行区切りで連結し、一度に MeCab へ渡す
+        joined = "\n".join(surfaces)
+        toks = tokenize_mecab(joined, MECAB_TAGGER)
+
+        result_read: Dict[str, str] = {}
+        result_lemma: Dict[str, str] = {}
+
+        cur_surface_parts: List[str] = []
+        cur_lemma_parts: List[str] = []
+        cur_idx = 0
+        surf_list = list(surfaces)
+
+        for surf in surf_list:
+            cur_surface_parts.clear()
+            cur_lemma_parts.clear()
+            while cur_idx < len(toks):
+                tsurf, _, lemma, reading, _, _ = toks[cur_idx]
+                cur_idx += 1
+                if tsurf == "\n":
+                    break
+                cur_surface_parts.append(reading or "")
+                cur_lemma_parts.append(lemma if lemma else tsurf)
+            result_read[surf] = "".join(cur_surface_parts)
+            result_lemma[surf] = "".join(cur_lemma_parts)
+
+        return result_read, result_lemma
+
+    surf2read, surf2lemma = _batch_reading_and_lemma(surfaces)
+
     surf2core  = {s: _surface_core_for_reading(s) for s in surfaces}
     surf2script = {s: _script_pattern(s) for s in surfaces}
 
@@ -667,27 +606,25 @@ def recalibrate_reading_like_scores(df: pd.DataFrame, read_th: float) -> pd.Data
         sim = reading_sim_with_penalty(a, b, ra, rb, read_th)
         if sim is not None:
             val = float(sim)
-            # P3: lemma一致 & 表層差
             if val >= 0.9999 and a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")):
                 val -= 0.02
-            # P4: 同スクリプト構成 & 読みが異なる
             if pattern_equal and read_mismatch:
                 val -= READ_MISMATCH_PENALTY
             return max(val, 0.0)
 
-        # 3) 読みが取れなかった場合でも、満点のままにしない（P0/P1/P2/P3/P4 の合算）
+        # 3) 読みが取れなかった場合でも、満点のままにしない（P0〜P4）
         penal = 1.0
-        if a != b: penal -= 0.01                                        # P0
-        if _has_kanji(a) != _has_kanji(b): penal -= 0.01                 # P1（グローバルの _has_kanji を利用）
-        if _norm_len_for_surface(a) != _norm_len_for_surface(b): penal -= 0.05  # P2（グローバル利用）
-        if a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")): penal -= 0.02  # P3
-        if pattern_equal and read_mismatch: penal -= READ_MISMATCH_PENALTY      # P4
+        if a != b: penal -= 0.01
+        if _has_kanji(a) != _has_kanji(b): penal -= 0.01
+        if _norm_len_for_surface(a) != _norm_len_for_surface(b): penal -= 0.05
+        if a != b and (surf2lemma.get(a, "") == surf2lemma.get(b, "")): penal -= 0.02
+        if pattern_equal and read_mismatch: penal -= READ_MISMATCH_PENALTY
         return max(penal, 0.0)
 
     df.loc[mask, "score"] = df.loc[mask].apply(_calc, axis=1)
     df.loc[mask, "reason"] = "reading"
     return df
-# --- /REPLACE ---
+
 
 def _ngram_set(s: str, n: int = 2):
     return {s[i:i+n] for i in range(len(s)-n+1)} if len(s) >= n else {s}
@@ -1149,7 +1086,7 @@ class PageData:
 def _compose_text_from_rawdict(
     page,
     *,
-    vertical_strategy: str = "auto",  # "auto" | "force_v" | "force_h" | "strict_y"
+    vertical_strategy: str = "auto",
     drop_marginal: bool = False,
     margin_ratio: float = 0.045,
     col_bin_ratio_h: float = 0.08,
@@ -1160,14 +1097,12 @@ def _compose_text_from_rawdict(
     char_tab_ratio_v: float = 0.012,
     drop_ruby: bool = True,
     ruby_size_ratio: float = 0.60,
+    font_size_tolerance: float = 0.15,  # 15%に拡大
+    debug_font_changes: bool = False,  # デバッグモード追加
 ) -> str:
     """
-    PDF rawdictを座標ベースでテキスト復元し、横組みの改行整理(KEEP_NL)は維持。
-    縦組みの行内/列内連結と strict_y の縦クラスタ処理を移植して一体化。
-
-    - 横組み: 既存の「A~C条件の行結合＋英数連結時のスペース補完＋境界行除外＋KEEP_NL挿入」を維持
-    - 縦組み: charsベース連結(Δyでspace/tab)＋ルビ除去(中央値×比率)に置換
-               strict_y 時はページ全体の縦文字クラウド→列クラスタ→右→左／上→下で連結
+    PDF rawdictを座標ベースでテキスト復元
+    縦組みテキストでフォントサイズが変化した箇所では改行を保持
     """
     import statistics
     from collections import defaultdict
@@ -1206,7 +1141,7 @@ def _compose_text_from_rawdict(
             return "".join(ch.get("c", "") for ch in chs)
         return ""
 
-    # ヘルパー: 行の縦判定（wmode/dir 優先＋文字分布のIQR比）
+    # ヘルパー: 行の縦判定
     def _is_vertical_line(ln) -> bool:
         wmode = ln.get("wmode")
         if isinstance(wmode, int) and wmode == 1:
@@ -1219,7 +1154,6 @@ def _compose_text_from_rawdict(
                     return True
             except Exception:
                 pass
-        # fallback: 行の文字分布
         chars = []
         for sp in ln.get("spans", []):
             size = float(sp.get("size", 0.0) or 0.0)
@@ -1257,7 +1191,6 @@ def _compose_text_from_rawdict(
             iqr_y = sum((y - my) * (y - my) for y in ys) / len(ys)
         return (iqr_y > iqr_x * 1.6)
 
-    # 横行の X 範囲（横結合のA条件用）
     def _line_x_range(ln):
         xs = []
         for sp in ln.get("spans", []):
@@ -1273,7 +1206,7 @@ def _compose_text_from_rawdict(
             return None
         return (min(xs), max(xs))
 
-    # ブロック収集（座標・行群・フォント中央値）
+    # ブロック収集
     blist = []
     for b in blocks:
         if b.get("type", 1) != 0:
@@ -1316,12 +1249,11 @@ def _compose_text_from_rawdict(
         page_mode = "v"
     elif vertical_strategy == "force_h":
         page_mode = "h"
-    else:  # "auto" or "strict_y"
+    else:
         page_mode = "v" if v_total > h_total else "h"
 
-    # === 横ブロックの統合処理（既存の正しいロジックを維持） ===
+    # === 横ブロックの統合処理 ===
     def _line_info_horizontal(ln, span_space_h: float, cell_tab_h: float) -> dict:
-        """横組み1行からテキスト/座標/フォントサイズを抽出"""
         spans = ln.get("spans", [])
         if not spans:
             return {}
@@ -1368,7 +1300,6 @@ def _compose_text_from_rawdict(
             "font_size": font_size,
         }
 
-    # 全横ブロックから全横行を収集（出現順を維持）
     all_h_lines = []
     for tb in blist:
         if tb["orient"] != "h":
@@ -1380,28 +1311,23 @@ def _compose_text_from_rawdict(
             if line_info:
                 all_h_lines.append(line_info)
 
-    # A~C条件で横行を結合（KEEP_NL維持・英数スペース補完・境界行除外）
     def _merge_all_horizontal_lines(line_dicts: list[dict]) -> str:
         import re
         KEEP = "[KEEP_NL]"
 
         def _is_bullet_line(text: str) -> bool:
-            """行頭がビュレット(箇条書き記号)かどうか判定"""
             if not text:
                 return False
-            
-            # よくあるビュレット文字パターン
             bullet_patterns = [
-                r'^[・•●○◆◇■□▪▫★☆→⇒›»]',  # 記号類
-                r'^[①-⑳]',  # 丸数字
-                r'^[⑴-⒇]',  # 括弧付き数字
-                r'^[\d]+[.．)）]\s',  # 1. 1) 1） などの数字+区切り
-                r'^[a-zA-Z][.．)）]\s',  # a. a) などの英字+区切り
-                r'^[-−‐–—]\s',  # ハイフン類
-                r'^[*＊]\s',  # アスタリスク
-                r'^[+＋]\s',  # プラス記号
+                r'^[・•●○◆◇■□▪▫★☆→⇒›»]',
+                r'^[①-⑳]',
+                r'^[⑴-⒇]',
+                r'^[\d]+[.．)）]\s',
+                r'^[a-zA-Z][.．)）]\s',
+                r'^[-−‐–—]\s',
+                r'^[*＊]\s',
+                r'^[+＋]\s',
             ]
-            
             for pattern in bullet_patterns:
                 if re.match(pattern, text.strip()):
                     return True
@@ -1411,12 +1337,9 @@ def _compose_text_from_rawdict(
             s = re.sub(r'\s+', '', text or '')
             if not s:
                 return False
-            # 数字だけの行
             if re.fullmatch(r'[0-9]+', s):
                 return True
-            # 1文字のASCII英字 or ASCII記号だけの行
-            if len(s) == 1 and re.fullmatch(r'[A-Za-z]'
-                                            r'|[ -/:-@\[-`{-~]', s):
+            if len(s) == 1 and re.fullmatch(r'[A-Za-z]|[ -/:-@\[-`{-~]', s):
                 return True
             return False
 
@@ -1425,7 +1348,6 @@ def _compose_text_from_rawdict(
                 return b or ''
             if not b:
                 return a
-            # 英数がくっつくのを防ぐ
             if re.search(r'[A-Za-z0-9]$', a) and re.search(r'^[A-Za-z0-9]', b):
                 return a + ' ' + b
             return a + b
@@ -1440,25 +1362,20 @@ def _compose_text_from_rawdict(
             prev_line = line_dicts[i - 1]
             curr_line = line_dicts[i]
 
-            # 前の行または現在の行が結合除外対象の場合
             if _is_merge_exempt(prev_line["text"]) or _is_merge_exempt(curr_line["text"]):
                 merged.append(buffer + KEEP)
                 buffer = curr_line["text"]
                 continue
 
-            # 現在の行がビュレット行の場合は改行を保持
             if _is_bullet_line(curr_line["text"]):
                 merged.append(buffer + KEEP)
                 buffer = curr_line["text"]
                 continue
 
-            # A: X範囲交差
             x_overlap = not (prev_line["x1"] < curr_line["x0"] or curr_line["x1"] < prev_line["x0"])
-            # B: 下方向 & 行高×2以内
             y_condition = (curr_line["top"] > prev_line["top"]) and (
                 (curr_line["top"] - prev_line["top"]) <= 2.0 * max(1.0, prev_line["height"])
             )
-            # C: フォント差（±10%以内）
             prev_fs = float(prev_line.get("font_size") or 0.0)
             curr_fs = float(curr_line.get("font_size") or 0.0)
             TOL = 0.10
@@ -1473,18 +1390,13 @@ def _compose_text_from_rawdict(
                 merged.append(buffer + KEEP)
                 buffer = curr_line["text"]
 
-        merged.append(buffer)  # 最後のバッファ確定
+        merged.append(buffer)
         return "\n".join(merged)
 
     parts_h_text = _merge_all_horizontal_lines(all_h_lines) if all_h_lines else ""
 
-    # === 縦行の復元（移植：縦版の char ベース + ルビ除去） ===
+    # === 縦行の復元（フォントサイズ変化で改行保持・強化版） ===
     def _build_line_text_vertical(ln) -> str:
-        """
-        縦行の復元: char を Y昇順で連結（Δyで space/tab）
-        - chars が無い span は Y 方向に等分して擬似文字座標を生成
-        - ルビ除去: 行内フォントサイズの中央値 × ruby_size_ratio 未満を削除
-        """
         import statistics as stats
 
         chars = []
@@ -1509,39 +1421,78 @@ def _compose_text_from_rawdict(
                     chars.append((c, x0, ly0, x1, ly1, size))
         if not chars:
             return ""
+        
+        if debug_font_changes:
+            print(f"[縦行] 収集した文字数: {len(chars)}")
+            sizes_before = [sz for *_, sz in chars if sz > 0]
+            if sizes_before:
+                print(f"[縦行] サイズ範囲（ルビ除去前）: {min(sizes_before):.1f} - {max(sizes_before):.1f}")
 
         # ルビ抑制
         med = 0.0
         if drop_ruby:
             sizes = [sz for *_, sz in chars if sz > 0]
             med = (stats.median(sizes) if sizes else 0.0)
+            if debug_font_changes and med > 0:
+                print(f"[縦行] フォント中央値: {med:.1f}, 閾値: {med * float(ruby_size_ratio):.1f}")
             if med > 0:
+                before_count = len(chars)
                 chars = [t for t in chars if not (t[-1] and t[-1] < med * float(ruby_size_ratio or 0.60))]
+                if debug_font_changes:
+                    print(f"[縦行] ルビ除去: {before_count} -> {len(chars)} 文字")
         if not chars:
             return ""
+        
+        if debug_font_changes:
+            sizes_after = [sz for *_, sz in chars if sz > 0]
+            if sizes_after:
+                print(f"[縦行] サイズ範囲（ルビ除去後）: {min(sizes_after):.1f} - {max(sizes_after):.1f}")
+                # 最初の10文字のサイズを表示
+                for i, (c, _, _, _, _, sz) in enumerate(chars[:10]):
+                    print(f"  文字[{i}]: '{c}' サイズ={sz:.1f}")
 
-        # 上→下（y0 昇順）で連結、Δy で space/tab
-        chars.sort(key=lambda t: t[2])  # y0
+        # Y昇順ソート
+        chars.sort(key=lambda t: t[2])
         parts = []
         prev_y1 = None
+        prev_size = None
+        
         for c, x0, y0, x1, y1, sz in chars:
             if prev_y1 is None:
                 parts.append(c)
+                prev_size = sz
             else:
                 gap = y0 - prev_y1
-                if gap >= char_tab_v:
-                    parts.append("\t"); parts.append(c)
+                
+                # フォントサイズ変化チェック（両方が正の値の時のみ）
+                size_changed = False
+                if prev_size > 0.1 and sz > 0.1:  # 極小値を除外
+                    size_ratio = sz / prev_size
+                    if size_ratio < (1 - font_size_tolerance) or size_ratio > (1 + font_size_tolerance):
+                        size_changed = True
+                        if debug_font_changes:
+                            print(f"[縦] サイズ変化検出: {prev_size:.1f} -> {sz:.1f} (比率: {size_ratio:.2f}) 文字: '{c}'")
+                
+                if size_changed:
+                    parts.append("\n")
+                    parts.append(c)
+                elif gap >= char_tab_v:
+                    parts.append("\t")
+                    parts.append(c)
                 elif gap >= char_space_v:
-                    parts.append(" "); parts.append(c)
+                    parts.append(" ")
+                    parts.append(c)
                 else:
                     parts.append(c)
-            prev_y1 = y1
+                
+                prev_y1 = y1
+                prev_size = sz
+        
         return "".join(parts).strip()
 
-    # === strict_y: ページ全体の縦charクラウド方式（移植） ===
+    # === strict_y モード ===
     if page_mode == "v" and vertical_strategy == "strict_y":
-        # 1) 縦行の char をページ全体から収集（chars 無しは Y 等分フォールバック）
-        vchars = []  # (c, cx, y0, y1, size)
+        vchars = []
         for tb in blist:
             for ln, is_v in tb["lines_oriented"]:
                 if not is_v:
@@ -1567,54 +1518,173 @@ def _compose_text_from_rawdict(
                             ly0 = y0 + i * h
                             ly1 = ly0 + h
                             vchars.append((c, cx, ly0, ly1, size))
+        
         if not vchars:
             return parts_h_text or ""
 
-        # 2) ルビ除去（中央値×比率）
+        # ルビ除去
         if drop_ruby:
             sizes = [sz for *_, sz in vchars if sz > 0]
             med = statistics.median(sizes) if sizes else 0.0
+            if debug_font_changes and med > 0:
+                print(f"[strict_y] 全体フォント中央値: {med:.1f}, ルビ閾値: {med * float(ruby_size_ratio):.1f}")
+                print(f"[strict_y] ルビ除去前の文字数: {len(vchars)}")
             if med > 0:
                 vchars = [t for t in vchars if not (t[-1] and t[-1] < med * float(ruby_size_ratio or 0.60))]
+            if debug_font_changes:
+                print(f"[strict_y] ルビ除去後の文字数: {len(vchars)}")
+                if vchars:
+                    sizes_after = [sz for *_, sz in vchars if sz > 0]
+                    if sizes_after:
+                        print(f"[strict_y] サイズ範囲: {min(sizes_after):.1f} - {max(sizes_after):.1f}")
         if not vchars:
             return parts_h_text or ""
 
-        # 3) X で列クラスタ（小さめビンで隣列の混在を防ぐ）
-        bin_w = max(8.0, width * 0.020) #0.020ものによって要調整
+        # X で列クラスタ
+        bin_w = max(8.0, width * 0.020)
         cols = defaultdict(list)
         for c, cx, y0, y1, sz in vchars:
             key = int(cx // bin_w)
             cols[key].append((c, cx, y0, y1, sz))
 
-        # 4) 各列を Y 昇順で連結 → 列は 右→左
+        # 各列を Y 昇順で連結（フォントサイズ変化で改行）
         out_cols = []
-        for k in sorted(cols.keys(), reverse=True):
+        prev_col_avg_size = None  # 前の列の平均フォントサイズ
+        prev_col_x = None  # 前の列のX座標（列間の距離チェック用）
+        
+        sorted_col_keys = sorted(cols.keys(), reverse=True)
+        
+        for col_idx, k in enumerate(sorted_col_keys):
             col = cols[k]
             col.sort(key=lambda t: t[2])  # y0
+            
+            # この列の平均フォントサイズとX座標を計算
+            col_sizes = [sz for *_, sz in col if sz > 0]
+            current_col_avg_size = sum(col_sizes) / len(col_sizes) if col_sizes else 0.0
+            
+            # 列のX座標（中央値）
+            col_x_coords = [cx for _, cx, *_ in col]
+            current_col_x = sum(col_x_coords) / len(col_x_coords) if col_x_coords else 0.0
+            
+            if debug_font_changes and col_idx < 3:
+                print(f"\n[strict_y列{col_idx}] 列の文字数: {len(col)}, X座標: {current_col_x:.1f}")
+                if col_sizes:
+                    print(f"[strict_y列{col_idx}] サイズ範囲: {min(col_sizes):.1f} - {max(col_sizes):.1f}")
+                    print(f"[strict_y列{col_idx}] 平均サイズ: {current_col_avg_size:.1f}")
+                    unique_sizes = sorted(set(col_sizes))
+                    print(f"[strict_y列{col_idx}] ユニークなサイズ: {[f'{s:.1f}' for s in unique_sizes]}")
+            
             parts = []
             prev_y1 = None
-            for c, cx, y0, y1, sz in col:
+            prev_size = None
+            size_change_count = 0
+            
+            for idx, (c, cx, y0, y1, sz) in enumerate(col):
                 if prev_y1 is None:
                     parts.append(c)
+                    prev_size = sz
                 else:
                     gap = y0 - prev_y1
-                    if gap >= char_tab_v:
-                        parts.append("\t"); parts.append(c)
+                    
+                    # フォントサイズ変化チェック
+                    size_changed = False
+                    if prev_size > 0.1 and sz > 0.1:
+                        size_ratio = sz / prev_size
+                        if size_ratio < (1 - font_size_tolerance) or size_ratio > (1 + font_size_tolerance):
+                            size_changed = True
+                            size_change_count += 1
+                            if debug_font_changes and col_idx < 3 and size_change_count <= 5:
+                                print(f"[strict_y列{col_idx}] サイズ変化#{size_change_count}: {prev_size:.1f} -> {sz:.1f} (比率: {size_ratio:.2f}, {(size_ratio-1)*100:.1f}%) 文字[{idx}]: '{c}' gap={gap:.1f}")
+                    
+                    if size_changed:
+                        parts.append("\n")
+                        parts.append(c)
+                    elif gap >= char_tab_v:
+                        parts.append("\t")
+                        parts.append(c)
                     elif gap >= char_space_v:
-                        parts.append(" "); parts.append(c)
+                        parts.append(" ")
+                        parts.append(c)
                     else:
                         parts.append(c)
-                prev_y1 = y1
+                    
+                    prev_y1 = y1
+                    prev_size = sz
+            
+            if debug_font_changes and col_idx < 3:
+                print(f"[strict_y列{col_idx}] 検出したサイズ変化の回数: {size_change_count}")
+            
             t = "".join(parts).strip()
             if t:
+                should_add_keep = False
+                
+                # 1. 前の列との平均サイズ差をチェック
+                if prev_col_avg_size is not None and current_col_avg_size > 0:
+                    size_ratio = current_col_avg_size / prev_col_avg_size
+                    if size_ratio < (1 - font_size_tolerance) or size_ratio > (1 + font_size_tolerance):
+                        should_add_keep = True
+                        if debug_font_changes and col_idx < 5:
+                            print(f"[strict_y] 列{col_idx-1}→列{col_idx}間でサイズ変化: {prev_col_avg_size:.1f} -> {current_col_avg_size:.1f} (比率: {size_ratio:.2f})")
+                
+                # 2. 列が1つ以上空いているかチェック（X座標の差が大きい）
+                if prev_col_x is not None:
+                    col_gap = abs(prev_col_x - current_col_x)
+                    # ビン幅の2倍以上離れている場合は列が空いていると判断
+                    if col_gap > bin_w * 2.0:
+                        should_add_keep = True
+                        if debug_font_changes and col_idx < 5:
+                            print(f"[strict_y] 列{col_idx-1}→列{col_idx}間で列アキ検出: X差={col_gap:.1f} (閾値={bin_w * 2.5:.1f})")
+                
+                # 3. 句点で終わっているかチェック
+                if out_cols and (out_cols[-1].rstrip().endswith('。') or out_cols[-1].rstrip().endswith('.')):
+                    # 前の列が句点で終わっている場合
+                    if not out_cols[-1].endswith(KEEP):
+                        out_cols[-1] = out_cols[-1] + KEEP
+                        if debug_font_changes and col_idx < 5:
+                            print(f"[strict_y] 列{col_idx-1}が句点で終了 -> KEEPマーカー追加")
+                
+                # KEEPマーカーを前の列に追加
+                if should_add_keep and out_cols and not out_cols[-1].endswith(KEEP):
+                    out_cols[-1] = out_cols[-1] + KEEP
+                
                 out_cols.append(t)
+                prev_col_avg_size = current_col_avg_size
+                prev_col_x = current_col_x
 
         chunks = []
         if out_cols:
-            chunks.append("\n\n".join(out_cols))  # 列区切りは空行
+            # 列間の結合（KEEPマーカーがある場合は改行を保持）
+            if debug_font_changes:
+                print(f"\n[strict_y] 出力列数: {len(out_cols)}")
+                for i, col_text in enumerate(out_cols[:5]):
+                    has_keep = KEEP in col_text
+                    print(f"[strict_y] 列{i}: KEEPあり={has_keep}, 長さ={len(col_text)}, 内容={repr(col_text[:50] if len(col_text) > 50 else col_text)}...末尾={repr(col_text[-20:])}")
+            
+            # 列を連結
+            result_parts = []
+            for i, col_text in enumerate(out_cols):
+                result_parts.append(col_text)
+                # KEEPマーカーがある場合はその後に改行を追加（KEEPマーカー自体は残す）
+                # KEEPマーカーがない場合は次の列と直接連結
+                if i < len(out_cols) - 1:  # 最後の列でない場合
+                    if col_text.endswith(KEEP):
+                        # KEEPで終わる場合は改行を追加
+                        result_parts.append("\n")
+                    # KEEPで終わらない場合は何も追加しない（直接連結）
+            
+            combined_text = "".join(result_parts)
+            chunks.append(combined_text)
+            
+            if debug_font_changes:
+                print(f"\n[strict_y] 結合後のテキスト（最初の600文字）:")
+                print(repr(combined_text[:600]))
+        
         if parts_h_text:
             chunks.append(parts_h_text)
-        return "\n\n".join([c for c in chunks if c])
+        
+        final_text = "\n\n".join([c for c in chunks if c])
+        
+        return final_text
 
     # === 既存の縦クラスタ(列単位) ===
     cols_v = defaultdict(list)
@@ -1624,7 +1694,6 @@ def _compose_text_from_rawdict(
             key = int(cx // col_bin_w_v)
             cols_v[key].append(tb)
 
-    # 縦ブロック → 行テキスト生成（移植した行復元を使用）
     def _build_block_text_v(tb) -> str:
         texts = []
         for ln, is_v in tb["lines_oriented"]:
@@ -1636,7 +1705,7 @@ def _compose_text_from_rawdict(
         return "\n".join(texts)
 
     parts_v = []
-    for ck in sorted(cols_v.keys(), reverse=True):  # 右→左
+    for ck in sorted(cols_v.keys(), reverse=True):
         col_blocks = sorted(cols_v[ck], key=lambda b: (b["y0"], b["x0"]))
         col_texts = []
         for b in col_blocks:
@@ -1646,7 +1715,7 @@ def _compose_text_from_rawdict(
         if col_texts:
             parts_v.append("\n".join(col_texts))
 
-    # ページ合成（縦→横 / 横→縦）
+    # ページ合成
     if page_mode == "v":
         chunks = []
         if parts_v:
@@ -1686,7 +1755,8 @@ def extract_pages(pdf_path: str, *, flatten_for_nlp: bool = False, v_strategy: s
                 page,
                 vertical_strategy=v_strategy,  # ← ここを引数で指定可能に
                 drop_marginal=False,
-                margin_ratio=0.05
+                margin_ratio=0.05,
+                debug_font_changes=False
             )
             # （以下は従来どおりのフォールバック）...
             if not text_blocked.strip():
@@ -4907,7 +4977,7 @@ class MainWindow(QMainWindow):
 
         # 高さは“上限”を付けてコンパクトに（必要なら数値を微調整）
         self.diff_view.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
-        self.diff_view.setMaximumHeight(120)  # ← 140〜180でお好み調整
+        self.diff_view.setMaximumHeight(180)  # ← 140〜180でお好み調整
 
         # スクロールバーは必要時のみ表示（高さ上限内でスクロール）
         self.diff_view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
