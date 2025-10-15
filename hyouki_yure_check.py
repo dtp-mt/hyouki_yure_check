@@ -3168,7 +3168,7 @@ def build_synonym_pairs_general(
     ng_char = [_ngram_set(s) for s in norm_surface]
 
     rows = []
-    step = max(1, n // 100)
+    step = max(1, n // 50)
 
     def try_reading_like(a, b, ra, rb, th):
         # 第1パス
@@ -3191,6 +3191,12 @@ def build_synonym_pairs_general(
 
             reason = None
             score = 0.0
+
+            # 🆕 更新頻度を上げる(元は100分割 → 200分割)
+            if progress_cb:
+                # より細かく進捗を報告(0.5%刻み)
+                if (i % max(1, n // 50) == 0) or i == n - 1:
+                    progress_cb(i + 1, n)
 
             # 1) lemma 優先（既存）
             if la and lb and la == lb and a != b:
@@ -3448,10 +3454,9 @@ def build_synonym_pairs_char_only(
             try:
                 rows_all.extend(fut.result())
             except Exception:
-                # サブタスク失敗は無視（ログ等が必要ならここで print など）
                 pass
             if progress_cb:
-                # i は 0..(n-1) を想定していたため、e をそのまま使う
+                # 🆕 チャンク完了ごとに進捗を報告(より細かく)
                 progress_cb(min(e, n-1), n)
 
     if not rows_all:
@@ -4465,35 +4470,60 @@ class AnalyzerWorker(QObject):
     finished = Signal(dict, str)
     progress = Signal(int)
     progress_text = Signal(str)
+    
     def __init__(self, files, use_mecab, read_th, char_th):
         super().__init__()
-        self.files = files; self.use_mecab = use_mecab
-        self.read_th = read_th; self.char_th = char_th
+        self.files = files
+        self.use_mecab = use_mecab
+        self.read_th = read_th
+        self.char_th = char_th
         self.top_k_lex = 4000
         self.min_count_lex = 1
-        self.min_len = 1; self.max_len = 120
+        self.min_len = 1
+        self.max_len = 120
+        
+        # 🆕 進捗の滑らか化用
+        self._current_progress = 0
+        self._last_emit_time = 0
+        self._min_emit_interval = 1.5  # 最小更新間隔(秒)
 
-    def _emit(self, v: int): self.progress.emit(max(0, min(100, int(v))))
+    def _emit(self, v: int):
+        """進捗を発火(重複抑制付き)"""
+        import time
+        now = time.time()
+        new_val = max(0, min(100, int(v)))
+        
+        # 同じ値または短時間での連続発火を抑制
+        if new_val == self._current_progress and (now - self._last_emit_time) < self._min_emit_interval:
+            return
+            
+        self._current_progress = new_val
+        self._last_emit_time = now
+        self.progress.emit(new_val)
 
-    # ★ 進捗テキストは “作業名のみ”
     def _subprogress_factory(self, start: int, end: int, label: str):
-        span = max(1, end - start)
-        state = {"p": -1}
-        def cb(i: int, n: int):
-            try:
-                n_ = max(1, int(n))
-                i_int = max(0, int(i))
-            except Exception:
-                n_ = 1
-                i_int = 0
-            p = start + int((span * i_int) / n_)
-            if p != state["p"]:
-                self._emit(p)
-                state["p"] = p
-            # “％表示しない” → 作業名だけ
-            if i_int == n_ or i_int % max(1, n_ // 20) == 0:
-                self.progress_text.emit(f"{label}中…")
-        return cb
+            """サブ進捗のコールバック工場(更新頻度を上げる)"""
+            span = max(1, end - start)
+            state = {"p": -1, "last_i": -1, "last_pct": -1}
+            
+            def cb(i: int, n: int):
+                try:
+                    n_ = max(1, int(n))
+                    i_int = max(0, int(i))
+                except Exception:
+                    n_ = 1
+                    i_int = 0
+                
+                p = start + int((span * i_int) / n_)
+                
+                # 🆕 進捗が変化した時のみ発火
+                if p != state["p"]:
+                    self._emit(p)
+                    state["p"] = p
+
+
+            
+            return cb
 
     # ===== [REPLACE] AnalyzerWorker.run（1パス時間比に最適化した進捗配分） =====
     def run(self):
@@ -4872,7 +4902,7 @@ class DropArea(QTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.60]")
+        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.61]")
         self.resize(1000, 700)
 
         # ---- レイアウト骨格 ----
@@ -4955,6 +4985,15 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.lbl_stage = QLabel("待機中")
         self.lbl_elapsed = QLabel("経過 00:00")
+
+        # 🆕 進捗バーの滑らか化用タイマー
+        self._progress_smooth_timer = QTimer(self)
+        self._progress_smooth_timer.setInterval(50)  # 50ms = 20fps
+        self._progress_smooth_timer.timeout.connect(self._smooth_progress_update)
+        
+        self._target_progress = 0  # 目標進捗値
+        self._current_smooth_progress = 0.0  # 現在の滑らか化された進捗
+        self._progress_smooth_speed = 0.3  # 追従速度(0-1の間、大きいほど速い)
 
         left.addWidget(gb_files)
         left.addWidget(gb_params)
@@ -5278,6 +5317,34 @@ class MainWindow(QMainWindow):
         fmt = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
         self.lbl_elapsed.setText(f"経過 {fmt}")
 
+    def _update_elapsed(self):
+        if self._t0 is None:
+            self.lbl_elapsed.setText("経過 00:00")
+            return
+        sec = max(0, int(time.monotonic() - self._t0))
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        fmt = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        self.lbl_elapsed.setText(f"経過 {fmt}")
+
+    def _smooth_progress_update(self):
+        """進捗バーを滑らかに更新(目標値へ徐々に近づける)"""
+        if abs(self._target_progress - self._current_smooth_progress) < 0.5:
+            # ほぼ到達したら即座に合わせる
+            self._current_smooth_progress = float(self._target_progress)
+            self.progress.setValue(int(self._current_smooth_progress))
+            return
+        
+        # 指数関数的に目標値へ近づける(イージング効果)
+        diff = self._target_progress - self._current_smooth_progress
+        self._current_smooth_progress += diff * self._progress_smooth_speed
+        
+        self.progress.setValue(int(round(self._current_smooth_progress)))
+
+    def _on_worker_progress(self, value: int):
+        """ワーカーからの進捗を受け取り、目標値として設定"""
+        self._target_progress = max(0, min(100, int(value)))
+
     def _refresh_candidate_count(self):
         try:
             df_u = getattr(self.model_unified, "_df", pd.DataFrame())
@@ -5407,6 +5474,29 @@ class MainWindow(QMainWindow):
         self.set_files([])
         self.drop.clear()
 
+        # 🆕 進捗バーの滑らか化用タイマー
+        self._progress_smooth_timer = QTimer(self)
+        self._progress_smooth_timer.setInterval(50)  # 50ms = 20fps で滑らか
+        self._progress_smooth_timer.timeout.connect(self._smooth_progress_update)
+        
+        self._target_progress = 0  # 目標進捗値
+        self._current_smooth_progress = 0  # 現在の滑らか化された進捗
+        self._progress_smooth_speed = 2.0  # 追従速度(値が大きいほど速い)
+
+    def _smooth_progress_update(self):
+        """進捗バーを滑らかに更新(目標値へ徐々に近づける)"""
+        if abs(self._target_progress - self._current_smooth_progress) < 0.5:
+            # ほぼ到達したら即座に合わせる
+            self._current_smooth_progress = self._target_progress
+            self.progress.setValue(int(self._current_smooth_progress))
+            return
+        
+        # 指数関数的に目標値へ近づける
+        diff = self._target_progress - self._current_smooth_progress
+        self._current_smooth_progress += diff * self._progress_smooth_speed * 0.05
+        
+        self.progress.setValue(int(self._current_smooth_progress))
+
     def on_run(self):
         if not self.files:
             QMessageBox.warning(self, "注意", "PDFを指定してください。")
@@ -5421,6 +5511,12 @@ class MainWindow(QMainWindow):
 
         self.btn_run.setEnabled(False)
         self.progress.setValue(0)
+        
+        # 🆕 滑らか化の初期化
+        self._target_progress = 0
+        self._current_smooth_progress = 0.0
+        self._progress_smooth_timer.start()
+        
         self._t0 = time.monotonic()
         self._update_elapsed()
         self._timer.start()
@@ -5430,15 +5526,33 @@ class MainWindow(QMainWindow):
         self.worker = AnalyzerWorker(self.files, True, self.dsb_read.value(), self.dsb_char.value())
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.progress.setValue)
+        
+        # 🆕 進捗シグナルを滑らか化機構に接続
+        self.worker.progress.connect(self._on_worker_progress)
+        
         self.worker.progress_text.connect(self.lbl_stage.setText)
         self.worker.finished.connect(self.on_finished)
         self.worker.finished.connect(lambda *_: self.thread.quit())
         self.thread.finished.connect(lambda: self.btn_run.setEnabled(True))
         self.thread.finished.connect(self.thread.deleteLater)
+        
+        # 🆕 完了時に滑らか化タイマーを停止
+        self.thread.finished.connect(self._progress_smooth_timer.stop)
+        
         self.thread.start()
 
+    def _on_worker_progress(self, value: int):
+        """ワーカーからの進捗を受け取り、目標値として設定"""
+        self._target_progress = max(0, min(100, int(value)))
+
+
     def on_finished(self, results: dict, error: str):
+        # 🆕 完了時は即座に100%へ
+        self._target_progress = 100
+        self._current_smooth_progress = 100.0
+        self.progress.setValue(100)
+        self._progress_smooth_timer.stop()
+        
         if error:
             QMessageBox.critical(self, "エラー", error)
             self.lbl_stage.setText("エラー")
@@ -5446,6 +5560,11 @@ class MainWindow(QMainWindow):
             return
 
         self.lbl_stage.setText("集計完了（表示中…）")
+
+        self._target_progress = 100
+        self._current_smooth_progress = 100
+        self.progress.setValue(100)
+        self._progress_smooth_timer.stop()
 
         df_unified = results.get("unified", pd.DataFrame())
         self.df_groups = results.get("groups", pd.DataFrame())
