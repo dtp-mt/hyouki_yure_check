@@ -4466,6 +4466,7 @@ class UnifiedFilterProxy(QSortFilterProxyModel):
 # ------------------------------------------------------------
 # Worker（★進捗配分を後半重めに再設計）
 # ------------------------------------------------------------
+# ========== AnalyzerWorker（_subprogress_factory を削除した版） ==========
 class AnalyzerWorker(QObject):
     finished = Signal(dict, str)
     progress = Signal(int)
@@ -4482,76 +4483,45 @@ class AnalyzerWorker(QObject):
         self.min_len = 1
         self.max_len = 120
         
-        # 🆕 進捗の滑らか化用
+        # 進捗のデバウンス（過剰なシグナル発火抑制）
         self._current_progress = 0
         self._last_emit_time = 0
-        self._min_emit_interval = 1.5  # 最小更新間隔(秒)
+        self._min_emit_interval = 0.10  # 100ms以上空ける（過剰更新防止）
 
     def _emit(self, v: int):
-        """進捗を発火(重複抑制付き)"""
+        """進捗を発火（重複＆過剰更新抑制付き）"""
         import time
         now = time.time()
         new_val = max(0, min(100, int(v)))
-        
         # 同じ値または短時間での連続発火を抑制
         if new_val == self._current_progress and (now - self._last_emit_time) < self._min_emit_interval:
             return
-            
         self._current_progress = new_val
         self._last_emit_time = now
         self.progress.emit(new_val)
 
-    def _subprogress_factory(self, start: int, end: int, label: str):
-            """サブ進捗のコールバック工場(更新頻度を上げる)"""
-            span = max(1, end - start)
-            state = {"p": -1, "last_i": -1, "last_pct": -1}
-            
-            def cb(i: int, n: int):
-                try:
-                    n_ = max(1, int(n))
-                    i_int = max(0, int(i))
-                except Exception:
-                    n_ = 1
-                    i_int = 0
-                
-                p = start + int((span * i_int) / n_)
-                
-                # 🆕 進捗が変化した時のみ発火
-                if p != state["p"]:
-                    self._emit(p)
-                    state["p"] = p
-
-
-            
-            return cb
-
-    # ===== [REPLACE] AnalyzerWorker.run（1パス時間比に最適化した進捗配分） =====
+    # ===== run() 全体で「progress_cb」を使わず、直接 _emit() する =====
     def run(self):
         try:
-            # ------------------------------------------------------------------
-            # 0) PDF抽出 0–12%
-            # ------------------------------------------------------------------
+            # 0) PDF抽出（0–12%）
             pages = []
             n_files = max(1, len(self.files))
             for i, f in enumerate(self.files, 1):
                 self.progress_text.emit("PDF抽出中…")
-                # 縦ページの忠実復元（strict_y）＆ NLP 用フラット化あり
                 pages += extract_pages(f, flatten_for_nlp=True, v_strategy="strict_y")
                 self._emit(int(12 * i / n_files))
             if not pages:
                 raise RuntimeError("PDFからテキストが取得できませんでした。")
 
-            # ------------------------------------------------------------------
-            # 1) 細粒度トークン参照 / 語彙構築 12–20%
-            # ------------------------------------------------------------------
+            # 1) 細粒度トークン参照 / 語彙構築（12–20%）
             self.progress_text.emit("細粒度トークン収集（参照）中…")
             if self.use_mecab and HAS_MECAB:
                 tokens_fine = extract_candidates_regex(
                     pages, self.min_len, self.max_len, self.min_count_lex
                 )
             else:
-                raise RuntimeError("MeCab (fugashi/unidic-lite) が必要です。")
-            self._emit(16)  # 参照トークン終了の目安
+                raise RuntimeError('MeCab (fugashi/unidic-lite) が必要です。 pip install "fugashi[unidic-lite]"')
+            self._emit(16)
 
             self.progress_text.emit("細粒度語彙の構築中…")
             df_lex = collect_lexicon_general(
@@ -4559,27 +4529,23 @@ class AnalyzerWorker(QObject):
             )
             self._emit(20)
 
-            # ------------------------------------------------------------------
-            # 2) 細粒度ペア生成（語彙ペア）20–45%
-            # ------------------------------------------------------------------
+            # 2) 細粒度ペア生成（語彙ペア）（20–45%）
+            # progress_cb を渡さずに直接実行
             df_pairs_lex_general = build_synonym_pairs_general(
                 df_lex,
                 read_sim_th=self.read_th,
                 char_sim_th=self.char_th,
                 scope="語彙",
-                progress_cb=self._subprogress_factory(20, 45, "細粒度ペア生成"),
             )
+            self._emit(45)
 
-            # ------------------------------------------------------------------
-            # 3) 複合語候補抽出 45–55%
-            # ------------------------------------------------------------------
+            # 3) 複合語候補抽出（45–55%）
             self.progress_text.emit("複合語候補抽出中…")
             tokens_compound_main = extract_candidates_compound_alljoin(
                 pages,
                 min_len=self.min_len, max_len=self.max_len,
                 min_count=self.min_count_lex, top_k=0, use_mecab=True
             )
-            # MeCabなしフォールバックもマージ
             tokens_compound_fb = extract_candidates_compound_alljoin(
                 pages,
                 min_len=self.min_len, max_len=self.max_len,
@@ -4593,20 +4559,17 @@ class AnalyzerWorker(QObject):
             tokens_compound = sorted(c_all.items(), key=lambda x: (-x[1], x[0]))
             self._emit(55)
 
-            # ------------------------------------------------------------------
-            # 4) 複合語ペア生成 55–78%
-            # ------------------------------------------------------------------
+            # 4) 複合語ペア生成（55–78%）
             df_pairs_compound = build_synonym_pairs_char_only(
                 tokens_compound,
                 char_sim_th=self.char_th,
                 top_k=self.top_k_lex, scope="複合語",
-                progress_cb=self._subprogress_factory(55, 78, "複合語ペア生成"),
                 read_sim_th=self.read_th,    # 読みもしきい値で判定
+                # progress_cb は渡さない
             )
+            self._emit(78)
 
-            # ------------------------------------------------------------------
-            # 5) 文・文節候補抽出（GiNZA 1パス）78–83%
-            # ------------------------------------------------------------------
+            # 5) 文・文節候補抽出（GiNZA 1パス）（78–83%）
             self.progress_text.emit("文・文節候補抽出中…")
             tokens_bunsetsu, tokens_sentence = extract_candidates_sentence_bunsetsu_onepass(
                 pages,
@@ -4616,59 +4579,42 @@ class AnalyzerWorker(QObject):
             )
             self._emit(83)
 
-            # ------------------------------------------------------------------
-            # 6) 文節ペア生成 83–92%
-            # ------------------------------------------------------------------
+            # 6) 文節ペア生成（83–92%）
             df_pairs_bunsetsu = build_synonym_pairs_char_only(
                 tokens_bunsetsu,
                 char_sim_th=self.char_th,
                 top_k=self.top_k_lex, scope="文節",
-                progress_cb=self._subprogress_factory(83, 92, "文節ペア生成"),
-                read_sim_th=self.read_th
+                read_sim_th=self.read_th,
             )
+            self._emit(92)
 
-            # ------------------------------------------------------------------
-            # 7) 文章ペア生成 92–97%
-            # ------------------------------------------------------------------
+            # 7) 文章ペア生成（92–97%）
             df_pairs_sentence = build_synonym_pairs_char_only(
                 tokens_sentence,
                 char_sim_th=self.char_th,
                 top_k=self.top_k_lex, scope="文章",
-                progress_cb=self._subprogress_factory(92, 97, "文章ペア生成"),
                 read_sim_th=self.read_th
             )
+            self._emit(97)
 
-            # ------------------------------------------------------------------
-            # 8) 統合・再採点・仕上げ 97–100%
-            # ------------------------------------------------------------------
+            # 8) 統合・再採点・仕上げ（97–100%）
             self.progress_text.emit("候補統合中…")
             df_unified = unify_pairs(
                 df_pairs_lex_general, df_pairs_compound, df_pairs_bunsetsu, df_pairs_sentence
             )
             self._emit(97)
 
-            # === [ADD] 読みキャッシュのプリウォーム ===
+            # 読みキャッシュのプリウォーム
             surfaces = []
             if not df_unified.empty and {"a", "b"}.issubset(df_unified.columns):
                 surfaces = pd.unique(pd.concat([df_unified["a"], df_unified["b"]]).astype("string")).tolist()
-
             self.progress_text.emit("読みキャッシュ準備中…")
-            prewarm_reading_caches(surfaces, keepchoon=True)  # ← ここでキャッシュを前広に効かせる
+            prewarm_reading_caches(surfaces, keepchoon=True)
 
-            # === 再採点・再分類 ===
+            # 再採点・再分類
             df_unified = recalibrate_reading_like_scores(df_unified, read_th=self.read_th)
-
-            # 最終スコアを combined に強制（score_reasonは作らない）
-            df_unified = enforce_combined_similarity_score(
-                df_unified,
-                keep_backup=False,
-                drop_existing_backup=True,
-            )
-
-            # 読み一致で 1.0 は 'basic' に付け替え
+            df_unified = enforce_combined_similarity_score(df_unified, keep_backup=False, drop_existing_backup=True)
             df_unified = reclassify_basic_for_reading_eq(df_unified, eps=0.0005)
-
-            # 読み一致（表記違い）へ再分類 → サニタイズ
             df_unified = reclassify_reading_equal_formdiff(df_unified)
             df_unified = sanitize_reading_same(df_unified)
 
@@ -4679,7 +4625,7 @@ class AnalyzerWorker(QObject):
                 df_unified = df_unified[~df_unified["a"].apply(is_single_kana_char)].reset_index(drop=True)
             self._emit(98)
 
-            # トークン一覧（fine/compound/bunsetsu/sentence）整形
+            # トークン一覧整形
             parts = []
             if len(tokens_fine) > 0:
                 df_fine = pd.DataFrame(tokens_fine, columns=["token", "count"]); df_fine["type"] = "fine"; parts.append(df_fine)
@@ -4693,9 +4639,8 @@ class AnalyzerWorker(QObject):
             if not df_tokens.empty:
                 df_tokens = df_tokens["type token count".split()].sort_values(["type","count","token"], ascending=[True, False, True])
 
-            # 表示用ラベル変換・各種前計算（端差/数字以外一致/内包/字数）
+            # 表示ラベル変換・各種前計算（端差/数字以外一致/内包/字数）
             df_unified = apply_reason_ja(df_unified)
-
             try:
                 if df_unified is not None and not df_unified.empty and "a" in df_unified.columns and "b" in df_unified.columns:
                     df_unified["端差"] = _edge_labels_vectorized(df_unified)
@@ -4703,7 +4648,6 @@ class AnalyzerWorker(QObject):
             except Exception:
                 pass
 
-            # 内包フラグの前計算
             try:
                 if df_unified is not None and not df_unified.empty and {"a","b"}.issubset(df_unified.columns):
                     sa = df_unified["a"].astype("string").map(lambda x: nfkc(x or "").lower())
@@ -4724,20 +4668,17 @@ class AnalyzerWorker(QObject):
                 if df_unified is not None and not df_unified.empty:
                     df_unified["__contains__"] = False
 
-            # 字数
             if not df_unified.empty and "a" in df_unified.columns:
                 try:
                     df_unified["字数"] = df_unified["a"].astype("string").str.len().fillna(0).astype(int)
                 except Exception:
                     df_unified["字数"] = df_unified["a"].astype(str).str.len().fillna(0).astype(int)
 
-            # 列順ざっくり整形
             cols = list(df_unified.columns)
             pref = [c for c in ["字数", "a", "b"] if c in cols]
             rest = [c for c in cols if c not in pref]
             df_unified = df_unified[pref + rest]
 
-            # グループ割当・gid 付与
             self.progress_text.emit("グループ割当中…")
             df_groups, surf2gid, gid2members = build_variation_groups(df_unified, df_lex)
             if not df_unified.empty and "a" in df_unified.columns:
@@ -4745,12 +4686,12 @@ class AnalyzerWorker(QObject):
                     lambda x: surf2gid.get(x) if isinstance(x, str) and x else None
                 )
 
-            # 完了！
+            # 完了
             self._emit(100)
             self.progress_text.emit("仕上げ中…")
             self.finished.emit(
                 {"unified": df_unified, "tokens": df_tokens, "groups": df_groups,
-                "surf2gid": surf2gid, "gid2members": gid2members},
+                 "surf2gid": surf2gid, "gid2members": gid2members},
                 ""
             )
 
