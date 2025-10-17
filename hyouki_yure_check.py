@@ -28,6 +28,69 @@ from PySide6.QtWidgets import (
 )
 # ===== [/PATCH] ======================
 
+# ===== [ADD] CPU負荷抑制（結果を変えずに並列度と優先度だけ下げる） =====
+import os
+import sys
+
+# 1) BLAS/OpenMP 等の並列スレッド数を起動時に制限（必ずプロセス再起動が必要）
+#    これで NumPy/MKL/OpenBLAS/numexpr 等が内部で多数スレッドを立てるのを抑止します。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+# 2) Thinc / spaCy が CUDA を誤検出するのを防ぐ（GPU を使っていないなら冗長だが安全）
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+os.environ.setdefault("USE_CUPY", "0")
+
+# 3) プロセス優先度を下げて OS レベルで CPU を譲る（結果の順序や中身には影響なし）
+try:
+    if sys.platform.startswith("linux") or sys.platform.startswith("darwin"):
+        # nice を +10 にして優先度を低くする（通常のユーザ権限で可能）
+        try:
+            os.nice(10)
+        except Exception:
+            pass
+    elif sys.platform.startswith("win"):
+        # Windows: pywin32 が無ければ ctypes 経由で優先度を BELOW_NORMAL に下げる
+        try:
+            import ctypes, ctypes.wintypes as wintypes
+            pid = os.getpid()
+            PROCESS_SET_INFORMATION = 0x0200
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+            if handle:
+                BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+                ctypes.windll.kernel32.SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS)
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+except Exception:
+    pass
+
+# 4) もし可能なら「実行中プロセスを特定コアに制限（affinity）」して同時稼働コア数を減らす
+#    Linux では os.sched_setaffinity が使えます。Windows では ctypes か psutil が必要（後述）。
+try:
+    # ここで使う core_count は 1..N の間で試し、効果と速度を見てください（例: 0..3 の4コアに限定）
+    desired_cores = None  # None のままだと変更しない。例: set([0,1]) で 2 コアに限定
+    if desired_cores:
+        if hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, set(desired_cores))
+        elif sys.platform.startswith("win"):
+            # Windows の場合、psutil があれば簡単に設定可能
+            try:
+                import psutil
+                p = psutil.Process(os.getpid())
+                p.cpu_affinity(list(desired_cores))
+            except Exception:
+                pass
+except Exception:
+    pass
+
+# 5) spaCy/GiNZA の内部で使われる .pipe(..., n_process=...) を 1 にしていることを前提にする
+#    （このスクリプト内の ginza 呼び出しは既に n_process=1 にしている想定）
+# ===== [/ADD] =====
+
 # 先頭の import 群のどこかに追加
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices
@@ -1847,7 +1910,7 @@ def ginza_bunsetsu_from_sentences(sentences: list[str]) -> list[str]:
     try:
         pipes_to_enable = [p for p in ["parser", "bunsetu_recognizer"] if p in GINZA_NLP.pipe_names]
         with GINZA_NLP.select_pipes(enable=pipes_to_enable):
-            for doc in GINZA_NLP.pipe(sentences, n_process=1, batch_size=8):
+            for doc in GINZA_NLP.pipe(sentences, n_process=1, batch_size=1):
                 for sent in doc.sents:
                     for sp in ginza.bunsetu_spans(sent):
                         s = re.sub(r"[\t\r\n]+", " ", sp.text).strip()
@@ -1921,7 +1984,7 @@ def ginza_sentence_units(text: str, *, max_len: int = 300) -> list[str]:
         try:
             pipes_to_enable = [p for p in ["sentencizer", "parser", "bunsetu_recognizer"] if p in GINZA_NLP.pipe_names]
             with GINZA_NLP.select_pipes(enable=pipes_to_enable):
-                for doc in GINZA_NLP.pipe(pre_chunks, n_process=1, batch_size=8):
+                for doc in GINZA_NLP.pipe(pre_chunks, n_process=1, batch_size=1):
                     for sent in doc.sents:
                         # GiNZA結果をさらに「。」で分割
                         for part in FORCE_SPLIT_RE.split(sent.text):
@@ -2002,7 +2065,7 @@ def ginza_sentence_and_bunsetsu_onepass(
             with GINZA_NLP.select_pipes(enable=pipes_to_enable):
                 # ★ ここが“1パス”：pre_chunks をまとめて GiNZA に渡し、
                 #   1回のパイプライン内で「文」と「文節」を両方回収します
-                for doc in GINZA_NLP.pipe(pre_chunks, n_process=1, batch_size=8):
+                for doc in GINZA_NLP.pipe(pre_chunks, n_process=1, batch_size=1):
                     for sent in doc.sents:
                         # --- 文（強制分割） ---
                         for part in FORCE_SPLIT_RE.split(sent.text):
@@ -2478,7 +2541,7 @@ def ginza_bunsetsu_fine_pos(sentences: list[str]) -> list[str]:
     try:
         pipes_to_enable = [p for p in ["parser", "bunsetu_recognizer"] if p in GINZA_NLP.pipe_names]
         with GINZA_NLP.select_pipes(enable=pipes_to_enable):
-            for doc in GINZA_NLP.pipe(sentences, n_process=1, batch_size=8):
+            for doc in GINZA_NLP.pipe(sentences, n_process=1, batch_size=1):
                 for sent in doc.sents:
                     for sp in ginza.bunsetu_spans(sent):
                         # ★ ここ：空白を保持して文節テキスト化
@@ -4564,9 +4627,11 @@ class AnalyzerWorker(QObject):
                 tokens_compound,
                 char_sim_th=self.char_th,
                 top_k=self.top_k_lex, scope="複合語",
-                read_sim_th=self.read_th,    # 読みもしきい値で判定
-                # progress_cb は渡さない
+                read_sim_th=self.read_th,
+                use_processes=False,       # 並列を無効化
+                max_workers=1              # 念のためワーカ数も1に
             )
+
             self._emit(78)
 
             # 5) 文・文節候補抽出（GiNZA 1パス）（78–83%）
