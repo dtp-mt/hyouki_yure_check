@@ -6374,6 +6374,10 @@ class MainWindow(QMainWindow):
 
                         # アノテーション反映
                         for r, text, row_no, kind in page_rects:
+                            # ★ 縦組み補正：矩形を少し上にずらす
+                            if abs(r.x1 - r.x0) < abs(r.y1 - r.y0):  # 縦長なら縦組みとみなす
+                                shift = (r.y1 - r.y0) * 0.25  # 文字高さの25%ぶん上へ
+                                r = fitz.Rect(r.x0, r.y0 - shift, r.x1, r.y1 - shift)
                             ann = page.add_highlight_annot(r)
                             width = 3
                             ann.set_info({
