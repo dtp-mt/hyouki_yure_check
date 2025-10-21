@@ -6021,7 +6021,7 @@ class MainWindow(QMainWindow):
         )
     # ===== [/REPLACE] =====
 
-
+    # ===== [REPLACE] on_mark_pdf: 縦組みマーキング修正版 =====
     def on_mark_pdf(self):
         """チェック済みの行に行番号(1,2,...)を振り、行内の a/b に 1-a, 1-b ... の注釈を付ける"""
         import os
@@ -6044,7 +6044,6 @@ class MainWindow(QMainWindow):
         col_b = df.columns.get_indexer(["b"])[0] if "b" in df.columns else -1
 
         # ===== 1) チェック済み行を a/b のペアとして束ね、行順で通し番号を振る土台を作成 =====
-        # rows: [ [("a", a_text?), ("b", b_text?)] , ... ]  ※aまたはbが欠ける場合もあり
         rows = []
         for r_proxy in range(self.proxy_unified.rowCount()):
             src_idx = self.proxy_unified.mapToSource(self.proxy_unified.index(r_proxy, 0))
@@ -6065,7 +6064,6 @@ class MainWindow(QMainWindow):
                     pair.append(("b", b))
 
             if pair:
-                # 念のため a→b の順を保証
                 pair.sort(key=lambda t: t[0])
                 rows.append(pair)
 
@@ -6073,7 +6071,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "情報", "マーキング対象が選択されていません。")
             return
 
-        # ===== 2) 色設定（従来踏襲） =====
+        # ===== 2) 色設定 =====
         COLOR_YELLOW = (0.98, 0.90, 0.25)  # a
         COLOR_CYAN   = (0.00, 0.90, 1.00)  # b
         HIGHLIGHT_COLORS = {"a": COLOR_YELLOW, "b": COLOR_CYAN}
@@ -6083,8 +6081,8 @@ class MainWindow(QMainWindow):
         if not out_dir:
             return
 
-        # ===== 3) 検索ユーティリティ（元実装の堅牢検索をそのまま使用） =====
-        CONN_CHARS = "ー\\-－–—・/／\\_＿"
+        # ===== 3) 検索ユーティリティ(元実装の堅牢検索をそのまま使用) =====
+        CONN_CHARS = "ー\\-−–—・/∕\\_＿"
         SPACE_CHARS = {" ", "\u00A0", "\u3000"}
 
         def nfkc(s: str) -> str:
@@ -6207,20 +6205,88 @@ class MainWindow(QMainWindow):
                 pos = k + 1
             return spans
 
-        def merge_to_line_rects(chars, idx_s: int, idx_e: int):
+        # ★ 修正: 縦組み対応のマージ処理
+        def merge_to_rects_smart(chars, idx_s: int, idx_e: int):
+            """
+            文字矩形を縦横組みを考慮してマージ。
+            同じ列(X座標が近い)かつY座標が連続する文字をまとめる。
+            """
             from collections import defaultdict
             items = chars[idx_s:idx_e+1]
             if not items:
                 return []
-            by_line = defaultdict(list)
+            
+            # X座標でグループ化(縦組み列の検出)
+            X_TOLERANCE = 5.0  # X座標が5pt以内なら同じ列とみなす
+            
+            # 各文字のX中心を計算
             for it in items:
-                by_line[it["line"]].append(it["rect"])
+                r = it["rect"]
+                it["x_center"] = (r.x0 + r.x1) / 2.0
+                it["y_center"] = (r.y0 + r.y1) / 2.0
+            
+            # X座標でソートして列を検出
+            items_sorted = sorted(items, key=lambda it: it["x_center"])
+            
+            columns = []  # [(x_center, [items])]
+            current_col = []
+            prev_x = None
+            
+            for it in items_sorted:
+                x = it["x_center"]
+                if prev_x is None or abs(x - prev_x) <= X_TOLERANCE:
+                    current_col.append(it)
+                    prev_x = x
+                else:
+                    if current_col:
+                        avg_x = sum(i["x_center"] for i in current_col) / len(current_col)
+                        columns.append((avg_x, current_col))
+                    current_col = [it]
+                    prev_x = x
+            
+            if current_col:
+                avg_x = sum(i["x_center"] for i in current_col) / len(current_col)
+                columns.append((avg_x, current_col))
+            
+            # 各列内でY座標が連続する部分をマージ
             rects = []
-            for ln in sorted(by_line.keys()):
-                rs = by_line[ln]
-                x0 = min(r.x0 for r in rs); y0 = min(r.y0 for r in rs)
-                x1 = max(r.x1 for r in rs); y1 = max(r.y1 for r in rs)
-                rects.append(fitz.Rect(x0, y0, x1, y1))
+            Y_TOLERANCE = 3.0  # Y座標が3pt以内なら連続とみなす
+            
+            for avg_x, col_items in columns:
+                # Y座標でソート
+                col_items_sorted = sorted(col_items, key=lambda it: it["y_center"])
+                
+                # 連続する文字グループを作成
+                groups = []
+                current_group = []
+                prev_y = None
+                
+                for it in col_items_sorted:
+                    y = it["y_center"]
+                    r = it["rect"]
+                    char_h = r.y1 - r.y0
+                    
+                    if prev_y is None or abs(y - prev_y) <= max(Y_TOLERANCE, char_h * 1.2):
+                        current_group.append(it)
+                        prev_y = y
+                    else:
+                        if current_group:
+                            groups.append(current_group)
+                        current_group = [it]
+                        prev_y = y
+                
+                if current_group:
+                    groups.append(current_group)
+                
+                # 各グループから矩形を作成
+                for grp in groups:
+                    rs = [it["rect"] for it in grp]
+                    x0 = min(r.x0 for r in rs)
+                    y0 = min(r.y0 for r in rs)
+                    x1 = max(r.x1 for r in rs)
+                    y1 = max(r.y1 for r in rs)
+                    rects.append(fitz.Rect(x0, y0, x1, y1))
+            
             return rects
 
         def dedup(rects):
@@ -6247,10 +6313,10 @@ class MainWindow(QMainWindow):
             stream_hits = []
             for qk in qnorm_keep_set:
                 for s_idx, e_idx in search_stream(stream_keep, keep_idxmap, qk):
-                    stream_hits.extend(merge_to_line_rects(chars, s_idx, e_idx))
+                    stream_hits.extend(merge_to_rects_smart(chars, s_idx, e_idx))
             for qn in qnorm_noch_set:
                 for s_idx, e_idx in search_stream(stream_noch, noch_idxmap, qn):
-                    stream_hits.extend(merge_to_line_rects(chars, s_idx, e_idx))
+                    stream_hits.extend(merge_to_rects_smart(chars, s_idx, e_idx))
             stream_hits = dedup(stream_hits)
 
             search_hits = []
@@ -6291,7 +6357,7 @@ class MainWindow(QMainWindow):
                     kept.append(r)
             return kept
 
-        # ===== 4) PDF へマーキング（行番号は rows の並び順で 1,2,3,... 固定） =====
+        # ===== 4) PDF へマーキング =====
         try:
             for src in self.files:
                 doc = None
@@ -6299,7 +6365,6 @@ class MainWindow(QMainWindow):
                     doc = fitz.open(src)
                     for page in doc:
                         page_rects = []
-                        # row_no はページ/ファイルをまたいでも同じ行に対して一定
                         for row_no, pair in enumerate(rows, start=1):
                             for kind, s in pair:
                                 rects = robust_find_on_page(page, [s])
@@ -6307,7 +6372,7 @@ class MainWindow(QMainWindow):
                                 for r in rects:
                                     page_rects.append((r, s, row_no, kind))
 
-                        # アノテーション反映（title: "行-種別", subject: "#行"）
+                        # アノテーション反映
                         for r, text, row_no, kind in page_rects:
                             ann = page.add_highlight_annot(r)
                             width = 3
@@ -6329,7 +6394,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "完了", "PDFへマーキングしました。")
         except Exception as e:
             QMessageBox.critical(self, "エラー", str(e))
-
+    # ===== [/REPLACE] =====
 
     # ===== [NEW] プレビュー更新: 選択インデックスから a/b を拾って差分を描画 =====
     def _show_inline_diff_for_index(self, proxy_index: QModelIndex):
