@@ -196,64 +196,6 @@ def sim_with_threshold(a: str, b: str, th: float) -> Optional[float]:
         return None
     return 1.0 - d / L
 
-# ===== [ADD] 軽量な縦組み判定＋縦テキスト復元ヘルパー =====
-def _v_is_vertical_line(ln) -> bool:
-    """rawdictの1行が縦組みっぽいかを判定（wmode/dir優先＋簡易形状）"""
-    try:
-        wmode = ln.get("wmode")
-        if isinstance(wmode, int) and wmode == 1:
-            return True
-        dirv = ln.get("dir")
-        if isinstance(dirv, (list, tuple)) and len(dirv) >= 2:
-            dx, dy = float(dirv[0]), float(dirv[1])
-            if abs(dy) > abs(dx):
-                return True
-    except Exception:
-        pass
-
-    # chars の幾何から fallback 判定（xs/ys の広がり比較）
-    def _chars_of_span(sp):
-        size = float(sp.get("size", 0.0) or 0.0)
-        chs = sp.get("chars")
-        if isinstance(chs, list) and chs:
-            for ch in chs:
-                x0, y0, x1, y1 = map(float, ch.get("bbox", (0,0,0,0)))
-                yield (x0+x1)/2.0, (y0+y1)/2.0
-        else:
-            txt = sp.get("text") or ""
-            if not txt:
-                return
-            x0, y0, x1, y1 = map(float, sp.get("bbox", (0,0,0,0)))
-            n = max(1, len(txt))
-            w = (x1-x0)/n if n else 0.0
-            for i in range(n):
-                cx = x0 + (i+0.5)*w
-                cy = (y0+y1)/2.0
-                yield cx, cy
-
-    xs, ys = [], []
-    for sp in ln.get("spans", []):
-        for cx, cy in _chars_of_span(sp):
-            xs.append(cx); ys.append(cy)
-    if len(xs) < 2:
-        return False
-
-    try:
-        import statistics as stats
-        qx = stats.quantiles(xs, n=4)
-        qy = stats.quantiles(ys, n=4)
-        iqr_x = qx[2]-qx[0]
-        iqr_y = qy[2]-qy[0]
-    except Exception:
-        # 平均平方偏差っぽい簡易
-        mx = sum(xs)/len(xs); my = sum(ys)/len(ys)
-        iqr_x = sum((x-mx)*(x-mx) for x in xs)/len(xs)
-        iqr_y = sum((y-my)*(y-my) for y in ys)/len(ys)
-
-    # “縦っぽさ”のしきいは既存と近い 1.6 倍基準
-    return (iqr_y > iqr_x * 1.6)
-
-
 # ==== 読み類似スコア（数・記号は読み対象外／満点抑制の強化版） ==================
 KANJI_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]")
 
@@ -714,31 +656,24 @@ except Exception:
     HAS_MECAB = False
     MECAB_TAGGER = None
 
-# === 最終スコアを combined_char_similarity で強制（score_reasonは作らない既定） ===
 def enforce_combined_similarity_score(
     df: pd.DataFrame,
-    keep_backup: bool = False,   # 既定で退避しない
-    drop_existing_backup: bool = True,  # 既にある 'score_reason' は落とす
+    *,
+    keep_backup: bool = False,
+    drop_existing_backup: bool = True,
+    overwrite_reasons: Optional[Set[str]] = None
 ) -> pd.DataFrame:
-    """
-    最終表示用に score を combined_char_similarity に差し替える。
-    keep_backup=True のときだけ元スコアを score_reason に退避（.3f）。
-    drop_existing_backup=True のとき、既にある score_reason を削除。
-    """
     if df is None or df.empty:
         return df
-    if not {"a", "b"}.issubset(df.columns):
+    if not {"a", "b", "reason", "score"}.issubset(df.columns):
         return df
 
     df = df.copy()
-
-    # バックアップ列の扱い
     if drop_existing_backup:
         df.drop(columns=["score_reason"], errors="ignore", inplace=True)
     if keep_backup and "score" in df.columns and "score_reason" not in df.columns:
         df["score_reason"] = pd.to_numeric(df["score"], errors="coerce").round(3)
 
-    # 表層キャッシュ（NFKC と 2-gram）
     try:
         uniq = pd.unique(pd.concat([df["a"], df["b"]]).astype("string"))
     except Exception:
@@ -747,14 +682,25 @@ def enforce_combined_similarity_score(
     nf = {}
     grams = {}
     for s in uniq:
-        s = "" if pd.isna(s) else str(s)
-        ns = nfkc(s)
-        nf[s] = ns
-        grams[s] = frozenset(_ngram_set(ns, 2))
+        s0 = "" if pd.isna(s) else str(s)
+        ns = nfkc(s0)
+        nf[s0] = ns
+        grams[s0] = frozenset(_ngram_set(ns, 2))
 
-    def _calc(row):
+    if overwrite_reasons is None:
+        overwrite_reasons = {"basic", "char"}
+
+    def _calc_row_score(row):
         a = "" if pd.isna(row["a"]) else str(row["a"])
         b = "" if pd.isna(row["b"]) else str(row["b"])
+        reason = str(row.get("reason", "") or "")
+
+        if reason not in overwrite_reasons:
+            try:
+                return float(pd.to_numeric(row.get("score", 0.0)))
+            except Exception:
+                return 0.0
+
         try:
             val = combined_char_similarity(
                 a, b,
@@ -762,32 +708,66 @@ def enforce_combined_similarity_score(
                 grams_a=grams.get(a), grams_b=grams.get(b),
             )
         except Exception:
-            # フォールバック：最悪でも 0.0〜1.0
             try:
                 val = max(0.0, min(1.0, float(levenshtein_sim(nfkc(a), nfkc(b)))))
             except Exception:
                 val = 0.0
-        return round(float(val), 3)
+        try:
+            v = float(val)
+        except Exception:
+            v = 0.0
 
-    df["score"] = df.apply(_calc, axis=1)
+        # safety clamp: 記号差（和字コア一致だが NFKC 等価でない）なら満点化を許さない
+        if is_symbol_only_surface_diff(a, b) and not _is_nfkc_only_diff(a, b):
+            v = min(v, 0.995)
+
+        return round(max(0.0, min(1.0, v)), 3)
+
+    df["score"] = df.apply(_calc_row_score, axis=1)
     return df
-# =====================================================================
 
-# === 読み一致( reading_eq )で最終スコア1.0のものを 'basic' に付け替え ==========
+# --- [REPLACE-B] reclassify_basic_for_reading_eq を保護付きに置換 ---
 def reclassify_basic_for_reading_eq(df: pd.DataFrame, eps: float = 0.0005) -> pd.DataFrame:
     """
-    df に対し、reason=='reading_eq' かつ score が 1.0（丸め誤差±eps）を 'basic' へ変更。
+    reason=='reading_eq' かつ score が 1.0 (丸め誤差込み) を basic に変更する既存処理の
+    保護版。記号差のみ（is_symbol_only_surface_diffがTrue）の場合は昇格しない。
     """
     if df is None or df.empty or "reason" not in df.columns or "score" not in df.columns:
         return df
     df = df.copy()
-    # 丸め誤差込みで 1.0 判定（例: 0.9996 以上は 1.000 とみなす）
-    m = (df["reason"] == "reading_eq") & (pd.to_numeric(df["score"], errors="coerce").fillna(0.0) >= 1.0 - eps)
-    if m.any():
-        df.loc[m, "reason"] = "basic"
-        df.loc[m, "score"] = 1.0  # 表示上も 1.0 にそろえる
+
+    # safe conversion
+    score_num = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
+
+    # mask: reason == 'reading_eq' and score >= 1.0 - eps
+    m = (df["reason"] == "reading_eq") & (score_num >= 1.0 - eps)
+
+    if not m.any():
+        return df
+
+    # ただし記号差のみの行は除外（昇格させない）
+    def _should_promote(row):
+        try:
+            a = "" if pd.isna(row.get("a")) else str(row.get("a"))
+            b = "" if pd.isna(row.get("b")) else str(row.get("b"))
+            # 記号差のみなら昇格させない
+            if is_symbol_only_surface_diff(a, b):
+                return False
+        except Exception:
+            return True
+        return True
+
+    # 適用インデックスを絞る
+    idx_candidates = df[m].index
+    idx_promote = [i for i in idx_candidates if _should_promote(df.loc[i])]
+    if idx_promote:
+        df.loc[idx_promote, "reason"] = "basic"
+        df.loc[idx_promote, "score"] = 1.0
+        if "一致要因" in df.columns:
+            df.loc[idx_promote, "一致要因"] = "基本一致"
+
     return df
-# =============================================================================
+# --- [/REPLACE-B] ---
 
 # ===== [ADD] phrase_reading_norm_keepchoon（長音あり読み生成） =====
 def phrase_reading_norm_keepchoon(s: str) -> str:
@@ -851,6 +831,50 @@ def _readings_equal_strict(a: str, b: str) -> bool:
 
     return True
 # =============================================================================
+
+# =====[ADD] 文字列類似ユーティリティ (jaccard_sim, levenshtein_sim) =====
+from functools import lru_cache
+
+def jaccard_sim(a_set: Set[str], b_set: Set[str]) -> float:
+    """2つの集合 (n-gram等) の Jaccard 類似度。空集合同士は 1.0 とする。"""
+    if a_set is None: a_set = set()
+    if b_set is None: b_set = set()
+    if not a_set and not b_set:
+        return 1.0
+    inter = a_set & b_set
+    union = a_set | b_set
+    if not union:
+        return 0.0
+    return float(len(inter)) / float(len(union))
+
+def levenshtein_sim(a: str, b: str) -> float:
+    """
+    正規化された Levenshtein 類似度を返す (1.0: 完全一致, 0.0: 完全不一致)。
+    長さ max(len(a), len(b)) で正規化する。内部で効率的な banded 処理を試す。
+    """
+    if a is None: a = ""
+    if b is None: b = ""
+    if a == b:
+        return 1.0
+    la, lb = len(a), len(b)
+    if la == 0 or lb == 0:
+        return 0.0
+
+    # 速い帯付き近似を試す（差が大きければすぐに 0 にする）
+    maxlen = max(la, lb)
+    # 許容距離は maxlen の 40% くらい（安全側）
+    k = max(1, int(maxlen * 0.4))
+    d = levenshtein_band(a, b, k)
+    if d is None:
+        # 帯幅超過 = 類似度小 -> 0.0 相当
+        return 0.0
+    # 正規化して返す
+    sim = 1.0 - (d / float(maxlen))
+    return max(0.0, min(1.0, sim))
+
+# (補助) ngram 作成用は既に _ngram_set があるため再定義不要
+# =====[/ADD]=====
+
 
 # =============================================================================
 # === [REPLACE] 読み一致（表記違い）: 厳格読み一致のみ昇格
@@ -916,19 +940,6 @@ def reclassify_reading_equal_formdiff(df: pd.DataFrame) -> pd.DataFrame:
             return tokenize_mecab(s, tagger)
         except Exception:
             return []
-
-    def _is_noun_only(s: str) -> bool:
-        toks = _tokens(s)
-        if not toks:
-            return False
-        for _, pos1, *_ in toks:
-            if not (isinstance(pos1, str) and pos1.startswith("名詞")):
-                return False
-        return True
-
-    def _is_single_morpheme(s: str) -> bool:
-        toks = _tokens(s)
-        return len(toks) == 1
 
     # ここから再分類
     idx = df.index[mask]
@@ -1021,6 +1032,17 @@ def hira_to_kata(s: str) -> str:
         o = ord(ch)
         out.append(chr(o + 0x60) if 0x3041 <= o <= 0x3096 else ch)
     return "".join(out)
+
+# === 追加: NFKC 正規化のみの差分判定（全角⇔半角 等） ===
+def _is_nfkc_only_diff(a: str, b: str) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        na = unicodedata.normalize("NFKC", str(a))
+        nb = unicodedata.normalize("NFKC", str(b))
+    except Exception:
+        return False
+    return (str(a) != str(b)) and (na == nb)
 
 def normalize_kana(s: str, drop_choon: bool = True) -> str:
     s = nfkc(s)
@@ -2877,46 +2899,44 @@ def _char_penalty(a: str, b: str) -> float:
 
     return float(p_len + p_num + p_core)
 
-def combined_char_similarity(
-    a: str,
-    b: str,
-    *,
-    sa: str | None = None,
-    sb: str | None = None,
-    grams_a=None,
-    grams_b=None,
-    w_lev: float = CHAR_SIM_W_LEV,
-    w_jacc: float = CHAR_SIM_W_JACC,
-    clamp: tuple[float, float] = (0.0, 1.0),
-) -> float:
-    """
-    文字ベースの最終スコア：
-        raw = w_lev * Levenshtein_sim  +  w_jacc * Jaccard2
-        score = clamp(raw - penalty)
+# ===== [PATCH] combined_char_similarity に記号無視正規化を追加 =====
+def _normalize_for_char_sim(s: str) -> str:
+    """表記ゆれ検出用の軽量正規化（中黒・ハイフン・空白など除去）"""
+    if not isinstance(s, str):
+        return ""
+    # よくある連結記号・空白を除去（NFKC後に）
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"[･・‐－―ー\-‐\s　]", "", s)
+    return s
 
-    - sa/sb: NFKC 済み表層を渡すと再正規化を避けられます
-    - grams_a/grams_b: 2-gram 集合（frozenset など）を渡すと再構築を避けられます
-    - 戻り値は [0.000, 1.000] に丸め（小数第3位）
-    """
-    # NFKC 済みを尊重（未指定なら正規化）
-    sa = nfkc(sa if sa is not None else (a or ""))
-    sb = nfkc(sb if sb is not None else (b or ""))
+# 既存の combined_char_similarity をラップする
+_original_combined_char_similarity = globals().get("combined_char_similarity")
 
-    # 完全一致は 1.0（basic）
-    if sa == sb:
+def combined_char_similarity(a: str, b: str, **kwargs) -> float:
+    """
+    既存の combined_char_similarity に、
+    中黒・ハイフン・空白を無視する軽量前処理を追加したラッパ。
+    """
+    if not a and not b:
         return 1.0
+    if not a or not b:
+        return 0.0
 
-    # 成分スコア
-    jacc = _jaccard_2gram(sa, sb, grams_a, grams_b)
-    levs = _lev_sim(sa, sb)
-    raw  = (w_lev * levs) + (w_jacc * jacc)
-    raw  = max(clamp[0], min(clamp[1], raw))
+    na = _normalize_for_char_sim(a)
+    nb = _normalize_for_char_sim(b)
 
-    # 軽い機械ペナルティ
-    pen = _char_penalty(a, b)
-    score = max(clamp[0], min(clamp[1], raw - pen))
+    # オリジナル呼び出し
+    func = _original_combined_char_similarity
+    if func is None:
+        # フォールバック：単純Levenshtein類似
+        return levenshtein_sim(na, nb)
+    try:
+        return func(na, nb, **kwargs)
+    except Exception:
+        # 失敗時フォールバック
+        return levenshtein_sim(na, nb)
+# ===== [/PATCH] =====
 
-    return round(float(score), 3)
 
 # ===== Edge-only difference (first/last 1-char) =====
 def classify_edge_diff(a: str, b: str) -> str:
@@ -3268,28 +3288,36 @@ def build_synonym_pairs_general(
                 else:
                     reason, score = "inflect", 0.95
             else:
-                # 1.5) 和字コア一致のみ（英数記号差）は reading_eq
-                if is_symbol_only_surface_diff(a, b) and a != b:
-                    reason, score = "reading_eq", reading_eq_score(a, b)
+                # 1) 全角/半角のみ(NFKC等価) → basic に確定（score=1.0）
+                if _is_nfkc_only_diff(a, b) and a != b:
+                    reason, score = "basic", 1.0
                 else:
-                    # 2) 読み類似
-                    sim_r = try_reading_like(a, b, ra, rb, read_sim_th)
-                    if sim_r is not None:
-                        reason, score = "reading", round(float(sim_r), 3)
+                    # 2) 記号差のみ（和字コア一致）→ reading_eq に割当。ただし満点化は防止
+                    if is_symbol_only_surface_diff(a, b) and a != b:
+                        rq = reading_eq_score(a, b)
+                        rq = float(rq) if rq is not None else 0.95
+                        # 明示的に 1.0 にしない（UIで basic に誤移動しないよう安全側で抑える）
+                        score = min(rq, 0.995)
+                        reason = "reading_eq"
                     else:
-                        # 3) 文字類似（合成：2-gram Jaccard × Levenshtein + 軽ペナルティ）
-                        inter = len(ng_char[i] & ng_char[j])
-                        union = len(ng_char[i] | ng_char[j])
-                        if union > 0 and (inter / union) >= 0.30:
-                            sim_val = combined_char_similarity(
-                                a, b,
-                                sa=sa, sb=sb,
-                                grams_a=ng_char[i], grams_b=ng_char[j],
-                            )
-                            if sim_val >= 0.999:
-                                reason, score = "basic", 1.0
-                            elif sim_val is not None and sim_val >= float(char_sim_th or 0.0):
-                                reason, score = "char", sim_val
+                        # 3) 読み類似
+                        sim_r = try_reading_like(a, b, ra, rb, read_sim_th)
+                        if sim_r is not None:
+                            reason, score = "reading", round(float(sim_r), 3)
+                        else:
+                            # 4) 文字類似（Jaccardフィルタを通した上で）
+                            inter = len(ng_char[i] & ng_char[j])
+                            union = len(ng_char[i] | ng_char[j])
+                            if union > 0 and (inter / union) >= 0.30:
+                                sim_val = combined_char_similarity(
+                                    a, b,
+                                    sa=sa, sb=sb,
+                                    grams_a=ng_char[i], grams_b=ng_char[j],
+                                )
+                                if sim_val is not None and sim_val >= 0.999:
+                                    reason, score = "basic", 1.0
+                                elif sim_val is not None and sim_val >= float(char_sim_th or 0.0):
+                                    reason, score = "char", float(sim_val)
 
             if reason:
                 # ★ scope を「名詞」「助・動詞」に二分
@@ -3316,219 +3344,59 @@ def build_synonym_pairs_general(
     )
 # ===== [/REPLACE] ==============================================================
 
-# ===== 並列版 build_synonym_pairs_char_only（関数ごと差し替え） =====
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import os
-import math
-
-# ===== [6-B2] 並列ワーカー差し替え：逆引きインデックスで候補前絞り =====
-def _pairs_chunk_worker(args):
-    """
-    子プロセス側：i 範囲を担当し、逆引きインデックスで候補を前絞りしてから判定。
-    文字類似は「2-gram Jaccard × Levenshtein の合成 + 軽ペナルティ」を用いる。
-    """
-    (i_start, i_end, words, counts, norm_char, read_norm,
-     ngram_list, char_sim_th, read_sim_th, scope) = args
-
-    rows = []
-    n = len(words)
-    JACC_TH = 0.30  # 粗フィルタ用（前段の足切り）
-
-    # 逆引きインデックス（ローカル構築）
-    from collections import defaultdict
-    inv = defaultdict(list)
-    for idx, grams in enumerate(ngram_list):
-        for g in grams:
-            inv[g].append(idx)
-    for g, lst in inv.items():
-        inv[g] = sorted(set(lst))
-
-    # 読み類似（第1/第2パス）
-    def try_reading_like(a, b, ra, rb, th):
-        sim = reading_sim_with_penalty(a, b, ra, rb, th)
-        if sim is not None:
-            return sim
-        if _has_kanji(a) != _has_kanji(b):
-            th2 = max(0.75, float(th) - 0.15)
-            return reading_sim_with_penalty(a, b, ra, rb, th2)
-        return None
-
-    for i in range(i_start, i_end):
-        a  = words[i]
-        sa = norm_char[i]
-        Ai = ngram_list[i]
-
-        # まず 2-gram の共起から候補集合
-        pool = set()
-        for g in Ai:
-            pool.update(inv.get(g, ()))
-        cand_js = [j for j in pool if j > i and j < n]
-
-        for j in cand_js:
-            b  = words[j]
-
-            # 【読み一致（和字コア一致のみ）→ 既存ロジック】
-            if read_sim_th is not None and is_symbol_only_surface_diff(a, b) and a != b:
-                rows.append({
-                    "a": a, "b": b,
-                    "a_count": counts[a], "b_count": counts[b],
-                    "reason": "reading_eq",
-                    "score": reading_eq_score(a, b),
-                    "scope": scope,
-                })
-                continue
-
-            # 【読み類似】（既存）
-            if read_sim_th is not None:
-                ra = read_norm[i] if read_norm[i] is not None else ""
-                rb = read_norm[j] if read_norm[j] is not None else ""
-                sim_r = try_reading_like(a, b, ra, rb, read_sim_th)
-                if sim_r is not None:
-                    rows.append({
-                        "a": a, "b": b,
-                        "a_count": counts[a], "b_count": counts[b],
-                        "reason": "reading",
-                        "score": round(float(sim_r), 3),
-                        "scope": scope,
-                    })
-                    continue
-
-            # 【文字類似】ここを “合成スコア” に差し替え
-            Aj = ngram_list[j]
-            inter = len(Ai & Aj)
-            union = len(Ai | Aj)
-            if union == 0:
-                continue
-            jacc = inter / union
-            if jacc < JACC_TH:  # 粗フィルタ
-                continue
-
-            sb = norm_char[j]
-            sim_val = combined_char_similarity(
-                a, b,
-                sa=sa, sb=sb,
-                grams_a=Ai, grams_b=Aj,
-            )
-
-            # 完全一致は "basic"、それ以外は "char"
-            if sim_val >= 0.999:
-                rows.append({
-                    "a": a, "b": b,
-                    "a_count": counts[a], "b_count": counts[b],
-                    "reason": "basic", "score": 1.0,
-                    "scope": scope,
-                })
-            elif sim_val >= float(char_sim_th or 0.0):
-                rows.append({
-                    "a": a, "b": b,
-                    "a_count": counts[a], "b_count": counts[b],
-                    "reason": "char", "score": sim_val,
-                    "scope": scope,
-                })
-
-    return rows
-
+# ===== [PATCH] build_synonym_pairs_char_only 高速化＋記号無視対応 =====
 def build_synonym_pairs_char_only(
-    tokens: List[Tuple[str,int]],
-    char_sim_th=0.90,
-    read_sim_th=None,
+    tokens,
+    char_sim_th=0.85,
     top_k=4000,
     scope="複合語",
-    progress_cb=None,
-    use_processes: bool = True,
-    max_workers: Optional[int] = None
-) -> pd.DataFrame:
-    """
-    並列対応・高速版：
-      - 読み類似は（指定時）帯付きLevenshtein
-      - 文字類似は n-gram Jaccard の粗フィルタ → 帯付きLevenshtein
-      - i の範囲をチャンク分割し、ProcessPoolExecutor で分散
-    """
+    read_sim_th=0.90,
+    use_processes=False,
+    max_workers=1,
+):
     if not tokens:
         return empty_pairs_df()
 
-    tokens = sorted(tokens, key=lambda x: (-x[1], x[0]))
-    if top_k and top_k > 0:
-        tokens = tokens[:top_k]
-
-    words = [w for w, _ in tokens]
-    counts = {w: int(c) for w, c in tokens}
-
-    # 正規化文字列
-    norm_char = [nfkc(w) for w in words]
-
-    # 読み正規化（キャッシュ利用）
-    use_reading = (read_sim_th is not None) and HAS_MECAB
-    read_norm = [""] * len(words)
-    if use_reading:
-        ok, _ = ensure_mecab()
-        if ok:
-            read_norm = [phrase_reading_norm_cached(w) for w in words]
-
-    # 2-gram の集合（frozenset にして子プロセスへシリアライズ負荷を軽減）
-    ngram_list = [frozenset(_ngram_set(s)) for s in norm_char]
-
+    words, counts = zip(*tokens)
+    words = list(words)
+    counts = list(counts)
     n = len(words)
-    if n < 2:
-        return empty_pairs_df()
 
-    # 逐次版（use_processes=False またはワーカ=1 の場合）
-    if not use_processes:
-        rows = _pairs_chunk_worker((0, n-1, words, counts, norm_char, read_norm,
-                                    ngram_list, char_sim_th, read_sim_th, scope))
-        if not rows:
-            return empty_pairs_df()
-        return pd.DataFrame(rows).sort_values(
-            ["score", "a_count", "b_count"], ascending=[False, False, False]
-        )
+    norm_char = [nfkc(w) for w in words]
+    ngram_list = [_ngram_set(s) for s in norm_char]
 
-    # 並列版
-    workers = max(1, (max_workers or os.cpu_count() or 1))
-    if workers == 1 or n < 1024:
-        # 要素数が少ない時はオーバーヘッド回避のため逐次
-        rows = _pairs_chunk_worker((0, n-1, words, counts, norm_char, read_norm,
-                                    ngram_list, char_sim_th, read_sim_th, scope))
-        if not rows:
-            return empty_pairs_df()
-        return pd.DataFrame(rows).sort_values(
-            ["score", "a_count", "b_count"], ascending=[False, False, False]
-        )
+    # 正規化キャッシュ（中黒・空白・ハイフン無視）
+    norm_symbol = [re.sub(r"[･・‐－―ー\-‐\s　]", "", s) for s in norm_char]
 
-    # i の分割（i は 0..n-2 を走査）
-    # チャンク数は workers * 4 目安（小さすぎると負荷分散が偏る）
-    total_i = n - 1
-    chunks = max(workers * 4, 1)
-    step = math.ceil(total_i / chunks)
-    tasks = []
-    futures = []
-    args_common = (words, counts, norm_char, read_norm, ngram_list, char_sim_th, read_sim_th, scope)
+    rows = []
+    for i in range(n):
+        a = words[i]
+        na = norm_symbol[i]
+        ga = ngram_list[i]
+        for j in range(i + 1, n):
+            b = words[j]
+            nb = norm_symbol[j]
+            gb = ngram_list[j]
 
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        for s in range(0, total_i, step):
-            e = min(total_i, s + step)
-            # 子プロセスにはタプルで引数一括渡し
-            args = (s, e, *args_common)
-            futures.append(ex.submit(_pairs_chunk_worker, args))
-            tasks.append((s, e))
+            # Jaccard で前絞り（高速）
+            jacc = jaccard_sim(ga, gb)
+            if jacc < 0.2:
+                continue
 
-        rows_all = []
-        # 進捗：チャンクの「終端 i」を元の n に写像して報告（おおよそでOK）
-        for (s, e), fut in zip(tasks, as_completed(futures)):
-            try:
-                rows_all.extend(fut.result())
-            except Exception:
-                pass
-            if progress_cb:
-                # 🆕 チャンク完了ごとに進捗を報告(より細かく)
-                progress_cb(min(e, n-1), n)
+            # combined_char_similarity (中黒無視ラップ済み)
+            score = combined_char_similarity(na, nb)
 
-    if not rows_all:
-        return empty_pairs_df()
+            if score >= char_sim_th:
+                rows.append({
+                    "a": a, "b": b,
+                    "a_count": counts[i], "b_count": counts[j],
+                    "reason": "char_sim", "score": score,
+                    "scope": scope,
+                })
 
-    return pd.DataFrame(rows_all).sort_values(
-        ["score", "a_count", "b_count"], ascending=[False, False, False]
-    )
-# ===== 並列版 ここまで =====
+    return pd.DataFrame(rows)
+# ===== [/PATCH] =====
+
 
 # ------------------------------------------------------------
 # 統合（★「読み類似」を最優先）
@@ -4678,7 +4546,39 @@ class AnalyzerWorker(QObject):
 
             # 再採点・再分類
             df_unified = recalibrate_reading_like_scores(df_unified, read_th=self.read_th)
-            df_unified = enforce_combined_similarity_score(df_unified, keep_backup=False, drop_existing_backup=True)
+
+            # --- [PATCH-A] 記号差のみで満点になっている行を強制的にスコア低減 ---
+            # 挿入箇所: enforce_combined_similarity_score(...) を呼ぶ直前
+            try:
+                if df_unified is not None and not df_unified.empty:
+                    def _safe_str(x): return "" if pd.isna(x) else str(x)
+                    # 判定マスク：和字コア一致かつ記号差のみ（既存ヘルパー利用）
+                    mask_sym_only = df_unified.apply(
+                        lambda r: is_symbol_only_surface_diff(_safe_str(r.get("a","")), _safe_str(r.get("b",""))),
+                        axis=1
+                    )
+                    if mask_sym_only.any():
+                        # 現在 score がほぼ満点になっている行だけ対象（丸め誤差を考慮）
+                        sc = pd.to_numeric(df_unified.loc[mask_sym_only, "score"], errors="coerce").fillna(0.0)
+                        idx_to_fix = sc[sc >= 0.9995].index
+                        if len(idx_to_fix):
+                            # reason を reading_eq に揃え、score を安全に 0.995 に下げる
+                            df_unified.loc[idx_to_fix, "score"] = df_unified.loc[idx_to_fix, "score"].map(lambda v: float(v) if v is not None else 0.995)
+                            if "reason" in df_unified.columns:
+                                df_unified.loc[idx_to_fix, "reason"] = "reading_eq"
+                            # 表示列（一致要因）も合わせる（UI側が「一致要因」を参照する場合）
+                            if "一致要因" in df_unified.columns:
+                                df_unified.loc[idx_to_fix, "一致要因"] = "読み一致（英数記号除く）"
+            except Exception:
+                pass
+            # --- [/PATCH-A] ---
+            #             
+            df_unified = enforce_combined_similarity_score(
+                df_unified,
+                keep_backup=False,
+                drop_existing_backup=True,
+                overwrite_reasons={"basic", "char"}
+            )
             df_unified = reclassify_basic_for_reading_eq(df_unified, eps=0.0005)
             df_unified = reclassify_reading_equal_formdiff(df_unified)
             df_unified = sanitize_reading_same(df_unified)
@@ -4750,6 +4650,84 @@ class AnalyzerWorker(QObject):
                 df_unified["gid"] = df_unified["a"].map(
                     lambda x: surf2gid.get(x) if isinstance(x, str) and x else None
                 )
+
+            # ヘルパー: 中黒や類似記号、英数記号、全角/半角スペースなどを除去して比較する
+            import re
+            _SYMBOL_RE = re.compile(r"[・･····•·••·•··︙︰﹒﹒\u00B7\u30FB\u2022\u2027\u2219\uFF65\.\s\u3000\-_／／･]+")
+
+            def _strip_interpunct_and_spaces(s: str) -> str:
+                """中黒・点・空白・一部区切り記号を除去したコア表層を返す。入力は任意の文字列を想定。"""
+                if s is None:
+                    return ""
+                s0 = str(s)
+                # まず NFKC で揃える（ただし呼び出し側で NFKC-only を除外するため保護対象は別途判断）
+                try:
+                    s0 = unicodedata.normalize("NFKC", s0)
+                except Exception:
+                    pass
+                # 記号類・空白を削る
+                return _SYMBOL_RE.sub("", s0)
+
+            # --- 最終ポストプロセス: 記号差の満点化抑止と reason 再調整 ---
+            # --- STEP 1: NFKC-only を basic に確定（保護） ---
+            try:
+                if df_unified is not None and not df_unified.empty:
+                    def _s(x): return "" if pd.isna(x) else str(x)
+                    def _nfkc(x): return unicodedata.normalize("NFKC", _s(x))
+
+                    mask_nfkc_only = df_unified.apply(
+                        lambda r: (_nfkc(r.get("a","")) == _nfkc(r.get("b",""))) and (_s(r.get("a","")) != _s(r.get("b",""))),
+                        axis=1
+                    )
+
+                    if mask_nfkc_only.any():
+                        if "reason" in df_unified.columns:
+                            df_unified.loc[mask_nfkc_only, "reason"] = "basic"
+                        if "一致要因" in df_unified.columns:
+                            df_unified.loc[mask_nfkc_only, "一致要因"] = "基本一致"
+                        df_unified.loc[mask_nfkc_only, "score"] = 1.0
+            except Exception:
+                pass
+            # --- /STEP 1 ---
+
+            # --- FINAL: 中黒・類似記号の有無差を一般化して reading_eq にする ---
+            try:
+                if df_unified is not None and not df_unified.empty:
+                    def _s(x): return "" if pd.isna(x) else str(x)
+                    def _nfkc(x): return unicodedata.normalize("NFKC", _s(x))
+
+                    # 1) 元が異なり NFKC-only ではない行を対象にする（全角半角は保護）
+                    mask_diff = df_unified.apply(lambda r: _s(r.get("a","")) != _s(r.get("b","")), axis=1)
+                    mask_not_nfkc_only = df_unified.apply(
+                        lambda r: not (_nfkc(r.get("a","")) == _nfkc(r.get("b","")) and _s(r.get("a","")) != _s(r.get("b",""))),
+                        axis=1
+                    )
+                    mask_candidate = mask_diff & mask_not_nfkc_only
+
+                    if mask_candidate.any():
+                        # 2) 記号除去後のコア文字列が一致するもの（中黒等の有無のみの差）
+                        mask_core_eq = df_unified.loc[mask_candidate].apply(
+                            lambda r: _strip_interpunct_and_spaces(r.get("a","")) == _strip_interpunct_and_spaces(r.get("b","")),
+                            axis=1
+                        )
+                        if mask_core_eq.any():
+                            idxs = mask_core_eq[mask_core_eq].index
+                            # 3) 最終適用: reason を reading_eq にし、score を下げる（保護のため NFKC-only は除外済）
+                            if "reason" in df_unified.columns:
+                                df_unified.loc[idxs, "reason"] = "reading_eq"
+                            if "一致要因" in df_unified.columns:
+                                df_unified.loc[idxs, "一致要因"] = "読み一致（英数記号除く）"
+                            # 明示的に 0.995 をセット（丸め誤差や再昇格を防ぐ）
+                            df_unified.loc[idxs, "score"] = 0.995
+
+                            try:
+                                probe = df_unified.loc[idxs, ["a","b","reason","score","一致要因"]].to_dict("records")
+                                print("INTERPUNCT_NORMALIZE applied to rows:", probe)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            # --- /FINAL ---        
 
             # 完了
             self._emit(100)
@@ -4908,7 +4886,7 @@ class DropArea(QTextEdit):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.61]")
+        self.setWindowTitle("PDF 表記ゆれチェック [ver.1.70]")
         self.resize(1000, 700)
 
         # ---- レイアウト骨格 ----
