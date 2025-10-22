@@ -4949,7 +4949,7 @@ class MainWindow(QMainWindow):
         self.dsb_char = QDoubleSpinBox()
         self.dsb_char.setRange(0.0, 1.0)
         self.dsb_char.setSingleStep(0.05)
-        self.dsb_char.setValue(0.85)
+        self.dsb_char.setValue(0.80)
         form.addRow("読み 類似しきい値", self.dsb_read)
         form.addRow("文字 類似しきい値", self.dsb_char)
 
